@@ -1,20 +1,19 @@
 FROM python:3.11-slim
 
-# System deps for OpenCV + Potrace
+# System deps needed for OpenCV
 RUN apt-get update && apt-get install -y \
-    potrace \
-    libgl1 \
-    libglib2.0-0 \
+    ffmpeg libsm6 libxext6 libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt ./requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+COPY . /app
 
+# Expose default port
 EXPOSE 8000
 
-# If you want HEAD on /health to not 405, make sure main.py handles HEAD too.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run Uvicorn and bind to Render's assigned port
+CMD ["bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
