@@ -1,19 +1,23 @@
+# ---- Base Python image ----
 FROM python:3.11-slim
 
-# System deps needed for OpenCV
-RUN apt-get update && apt-get install -y \
-    ffmpeg libsm6 libxext6 libgl1 \
+# ---- Install system dependencies, including potrace ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    potrace \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- Set working directory ----
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# ---- Install Python dependencies ----
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY . /app
+# ---- Copy the rest of the app code ----
+COPY . .
 
-# Expose default port
-EXPOSE 8000
+# ---- Expose port for Render ----
+ENV PORT=8000
 
-# Run Uvicorn and bind to Render's assigned port
-CMD ["bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# ---- Start server ----
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
