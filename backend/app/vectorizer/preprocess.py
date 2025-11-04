@@ -1,94 +1,82 @@
+# backend/app/vectorizer/preprocess.py
 import io
-from PIL import Image
+from typing import Tuple
 import numpy as np
-from scipy.spatial.distance import cdist
+import cv2
 
-# --------------------------------------------
-# Utility functions
-# --------------------------------------------
+def _denoise(img_bgr: np.ndarray) -> np.ndarray:
+    # Gentle denoise that preserves edges
+    # 1) Bilateral to remove jpeg artifacts
+    img = cv2.bilateralFilter(img_bgr, d=9, sigmaColor=75, sigmaSpace=75)
+    # 2) Very light median to knock single-pixel noise
+    img = cv2.medianBlur(img, 3)
+    return img
 
-def rgb2lab(rgb):
-    """Convert an RGB image (0-255) to CIELAB space."""
-    rgb = np.clip(rgb / 255.0, 0, 1)
-    mask = rgb <= 0.04045
-    rgb[mask] = rgb[mask] / 12.92
-    rgb[~mask] = ((rgb[~mask] + 0.055) / 1.055) ** 2.4
+def _maybe_upscale(img_bgr: np.ndarray, min_side: int = 800) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    s = min(h, w)
+    if s >= min_side:
+        return img_bgr
+    scale = float(min_side) / float(s)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    X = r * 0.4124 + g * 0.3576 + b * 0.1805
-    Y = r * 0.2126 + g * 0.7152 + b * 0.0722
-    Z = r * 0.0193 + g * 0.1192 + b * 0.9505
+def _quantize_lab(img_bgr: np.ndarray, n_colors: int) -> np.ndarray:
+    """
+    Perceptual (LAB) k-means quantization.
+    Ensures clean, consistent color regions for better tracing.
+    """
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    pixels = img_lab.reshape(-1, 3).astype(np.float32)
 
-    X /= 0.95047
-    Z /= 1.08883
-    XYZ = np.stack([X, Y, Z], axis=-1)
-    mask = XYZ > 0.008856
-    XYZ[mask] = np.cbrt(XYZ[mask])
-    XYZ[~mask] = (7.787 * XYZ[~mask]) + (16.0 / 116.0)
+    # k-means
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 80, 0.25)
+    # cap colors to [2..16] sane range
+    k = int(max(2, min(16, n_colors)))
+    _, labels, palette = cv2.kmeans(
+        data=pixels,
+        K=k,
+        bestLabels=None,
+        criteria=criteria,
+        attempts=8,
+        flags=cv2.KMEANS_PP_CENTERS
+    )
+    quant_lab = palette[labels.flatten()].reshape(img_lab.shape).astype(np.uint8)
+    quant_bgr = cv2.cvtColor(quant_lab, cv2.COLOR_LAB2BGR)
+    return quant_bgr
 
-    L = (116.0 * XYZ[..., 1]) - 16.0
-    a = 500.0 * (XYZ[..., 0] - XYZ[..., 1])
-    b = 200.0 * (XYZ[..., 1] - XYZ[..., 2])
-    return np.stack([L, a, b], axis=-1)
+def _morphology_cleanup(mask: np.ndarray) -> np.ndarray:
+    """
+    Clean binary mask: remove dust and fill tiny holes.
+    """
+    # Ensure binary (0/255)
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    # Open (remove small white noise)
+    kernel = np.ones((3, 3), np.uint8)
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    # Close (fill tiny holes)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return closed
 
+def preprocess_image(image_bytes: bytes, max_colors: int) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """
+    Load -> optional upscale -> denoise -> LAB quantize.
+    Returns:
+        quant_bgr (np.ndarray): preprocessed BGR image ready for color-layer tracing
+        original_size (w, h): original input size for viewBox generation
+    """
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode input image")
 
-def lab2rgb(lab):
-    """Convert LAB back to RGB (0-255)."""
-    Y = (lab[..., 0] + 16.0) / 116.0
-    X = lab[..., 1] / 500.0 + Y
-    Z = Y - lab[..., 2] / 200.0
-    X = np.clip(X, 0, None)
-    Y = np.clip(Y, 0, None)
-    Z = np.clip(Z, 0, None)
+    h, w = img.shape[:2]
+    original_size = (w, h)
 
-    XYZ = np.stack([X, Y, Z], axis=-1)
-    XYZ[..., 0] *= 0.95047
-    XYZ[..., 2] *= 1.08883
+    img = _maybe_upscale(img, min_side=800)
+    img = _denoise(img)
+    img = _quantize_lab(img, n_colors=max_colors)
 
-    rgb = np.zeros_like(XYZ)
-    rgb[..., 0] = XYZ[..., 0] * 3.2406 + XYZ[..., 1] * (-1.5372) + XYZ[..., 2] * (-0.4986)
-    rgb[..., 1] = XYZ[..., 0] * (-0.9689) + XYZ[..., 1] * 1.8758 + XYZ[..., 2] * 0.0415
-    rgb[..., 2] = XYZ[..., 0] * 0.0557 + XYZ[..., 1] * (-0.2040) + XYZ[..., 2] * 1.0570
-
-    mask = rgb > 0.0031308
-    rgb[mask] = 1.055 * (rgb[mask] ** (1 / 2.4)) - 0.055
-    rgb[~mask] = rgb[~mask] * 12.92
-
-    rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-    return rgb
-
-
-def kmeans_lab(pixels, k=8, iters=15):
-    """Simple K-means clustering in LAB space."""
-    pixels = pixels.reshape(-1, 3)
-    idx = np.random.choice(len(pixels), k, replace=False)
-    centers = pixels[idx]
-
-    for _ in range(iters):
-        dists = cdist(pixels, centers)
-        labels = np.argmin(dists, axis=1)
-        new_centers = np.array([pixels[labels == i].mean(axis=0) if np.any(labels == i) else centers[i] for i in range(k)])
-        if np.allclose(centers, new_centers, atol=1e-3):
-            break
-        centers = new_centers
-
-    return labels.reshape(-1, 1), centers
-
-
-# --------------------------------------------
-# Main preprocessing function
-# --------------------------------------------
-
-def load_and_quantize(img_bytes: bytes, max_colors: int = 8):
-    """Load image bytes, quantize to limited palette in LAB color space."""
-    bio = io.BytesIO(img_bytes)
-    img = Image.open(bio).convert("RGBA")
-    w, h = img.size
-    arr = np.array(img)  # HxWx4
-    rgb = arr[..., :3].astype(np.float32)
-    alpha = arr[..., 3:4].astype(np.float32) / 255.0
-    lab = rgb2lab(rgb)
-    lab_p = lab * np.clip(alpha, 0, 1)
-    labels, palette = kmeans_lab(lab_p, k=max_colors, iters=15)
-    qimg = palette[labels.flatten()].reshape(h, w, 3)
-    return qimg.astype(np.float32), palette.astype(np.float32), (w, h)
+    return img, original_size
