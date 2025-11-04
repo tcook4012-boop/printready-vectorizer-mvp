@@ -5,7 +5,11 @@ import cv2
 def lightness_from_lab(img_lab: np.ndarray) -> np.ndarray:
     """Return uint8 lightness image (0..255) from LAB-like quantized image."""
     L = img_lab[..., 0].astype(np.float32)
-    L = (255.0 * (L - L.min()) / (L.ptp() + 1e-6)).astype(np.uint8)
+    # NumPy 2.0: use np.ptp(L) instead of L.ptp()
+    rng = float(np.ptp(L))  # max - min
+    if rng < 1e-6:
+        return np.zeros_like(L, dtype=np.uint8)
+    L = (255.0 * (L - float(L.min())) / (rng + 1e-6)).astype(np.uint8)
     return L
 
 def find_dark_region_contours(img_lab: np.ndarray, min_area_px: int = 6):
@@ -21,7 +25,7 @@ def find_dark_region_contours(img_lab: np.ndarray, min_area_px: int = 6):
     # Close small gaps
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # Find contours with hierarchy (so we know holes vs outers)
+    # Find contours with hierarchy (handles holes)
     cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hier is None:
         return []
@@ -49,8 +53,8 @@ def poly_to_cubics(pts):
     closed = (pts[0] == pts[-1])
     rng = range(n-1) if not closed else range(n)
     for i in rng:
-        p0 = np.array(pts[i % n])
-        p3 = np.array(pts[(i+1) % n])
+        p0 = np.array(pts[i % n], dtype=np.float32)
+        p3 = np.array(pts[(i+1) % n], dtype=np.float32)
         t = p3 - p0
         p1 = p0 + t / 3.0
         p2 = p0 + 2.0 * t / 3.0
