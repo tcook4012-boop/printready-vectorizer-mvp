@@ -1,7 +1,11 @@
 fastapi
 uvicorn[standard]
-pillow
-numpy
-scipy
 python-multipart
-opencv-python-headless
+opencv-python-headless==4.8.1.78
+numpy<2.0
+Pillow
+scipy
+realesrgan
+basicsr
+facexlib
+gfpgan
