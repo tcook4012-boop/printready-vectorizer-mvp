@@ -1,42 +1,45 @@
-import cv2
-import numpy as np
-import base64
-import subprocess
-import tempfile
-import uuid
 import os
+import tempfile
+import subprocess
+from fastapi import HTTPException
+from PIL import Image
 
-def vectorize_image(image_bytes):
-    # Load image into OpenCV
-    image_array = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+def _png_to_pbm(src_img_path: str) -> str:
+    """Convert any raster (e.g., PNG/JPG) to 1-bit PBM for potrace."""
+    try:
+        img = Image.open(src_img_path).convert("L")       # grayscale
+        # Simple binarize. Tweak threshold if you like.
+        img = img.point(lambda p: 255 if p > 200 else 0)
+        img = img.convert("1")                            # 1-bit image
+        fd, pbm_path = tempfile.mkstemp(suffix=".pbm")
+        os.close(fd)
+        img.save(pbm_path)                                # PBM inferred from extension
+        return pbm_path
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Raster-to-PBM conversion failed: {e}")
 
-    if img is None:
-        raise Exception("Failed to load image")
+def vectorize_image(raster_path: str) -> str:
+    """Run potrace on the given raster image and return path to SVG."""
+    pbm_path = _png_to_pbm(raster_path)
 
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    fd, svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(fd)
 
-    # Threshold using Otsu
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cmd = ["potrace", pbm_path, "-s", "-o", svg_path]     # “-s” == SVG output
+    # Optional tuning flags you can add later:
+    # cmd += ["--turdsize", "10", "--alphamax", "1.0", "--opttolerance", "0.2"]
 
-    # Save temp PNG
-    tmp_input = f"/tmp/{uuid.uuid4()}.png"
-    tmp_output = f"/tmp/{uuid.uuid4()}.svg"
-    cv2.imwrite(tmp_input, thresh)
-
-    # Run potrace
-    cmd = ["potrace", "-s", tmp_input, "-o", tmp_output]
-    subprocess.run(cmd, check=True)
-
-    if not os.path.exists(tmp_output):
-        raise Exception("Potrace failed")
-
-    with open(tmp_output, "r", encoding="utf-8") as f:
-        svg_data = f.read()
-
-    # Cleanup
-    os.remove(tmp_input)
-    os.remove(tmp_output)
-
-    return svg_data
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"potrace failed (exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return svg_path
+    finally:
+        # Keep SVG; clean PBM
+        try:
+            os.remove(pbm_path)
+        except Exception:
+            pass
