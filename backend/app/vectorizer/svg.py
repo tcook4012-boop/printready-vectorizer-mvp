@@ -13,15 +13,16 @@ def path_from_cubics(cubics):
             first = False
         d.append(f"C {x1:.2f} {y1:.2f}, {x2:.2f} {y2:.2f}, {x3:.2f} {y3:.2f}")
     if start is not None:
-        d.append("Z")  # close
+        d.append("Z")
     return " ".join(d)
 
 def paths_to_svg(bezier_paths, width:int, height:int)->bytes:
     header = f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
     body = []
-    # Fill everything black by default; real engine will restore colors in next iteration
+    # Stroke-only so we don't fill everything black while we validate contours.
+    # Using evenodd anyway (will matter when we switch back to filled paths).
     for p in bezier_paths:
         d = path_from_cubics(p["beziers"])
-        body.append(f'<path d="{escape(d)}" fill="black" stroke="none" fill-rule="nonzero" />')
+        body.append(f'<path d="{escape(d)}" fill="none" stroke="black" stroke-width="1" fill-rule="evenodd" />')
     footer = "</svg>"
     return (header + "".join(body) + footer).encode("utf-8")
