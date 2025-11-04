@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# System deps (potrace + minimal libs some wheels probe for)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     potrace \
     libglib2.0-0 \
@@ -10,12 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Make sure we get the headless OpenCV wheel and stable resolver behavior
 COPY requirements.txt ./requirements.txt
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-# App code
 COPY app ./app
 
 EXPOSE 8000
