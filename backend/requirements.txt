@@ -4,3 +4,4 @@ pillow
 numpy
 scipy
 python-multipart
+opencv-python-headless
