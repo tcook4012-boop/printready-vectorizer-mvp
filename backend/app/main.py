@@ -1,34 +1,36 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from app.vectorizer.pipeline import vectorize_image
 
 app = FastAPI()
 
-@app.head("/health")
+# ✅ Allow frontend access
+origins = [
+    "https://printready-vectorizer-mvp.vercel.app",
+    "http://localhost:3000"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/health")
 def health():
-    return JSONResponse({"ok": True})
+    return {"ok": True}
 
-@app.get("/")
-def root():
-    return JSONResponse({"service": "printready-vectorizer-api", "status": "up"})
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
 
-@app.post("/vectorize")
-async def vectorize(
-    file: UploadFile = File(...),
-    max_colors: int = Form(8),
-    smoothness: str = Form("medium"),
-    primitive_snap: bool = Form(True),
-    min_feature_px: int = Form(4),
-):
-    img_bytes = await file.read()
-
-    svg_bytes, metrics = vectorize_image(
-        img_bytes=img_bytes,
-        max_colors=max_colors,
-        smoothness=smoothness,
-        primitive_snap=primitive_snap,
-        min_feature_px=min_feature_px,
-    )
-
-    return Response(content=svg_bytes, media_type="image/svg+xml")
+@app.post("/api/vectorize")
+async def vectorize(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        svg_output = vectorize_image(contents)
+        return {"svg": svg_output}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
