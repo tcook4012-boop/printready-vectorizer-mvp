@@ -3,3 +3,4 @@ uvicorn[standard]
 pillow
 numpy
 scipy
+python-multipart
