@@ -1,36 +1,32 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+import tempfile, os
 from app.vectorizer.pipeline import vectorize_image
 
 app = FastAPI()
 
-# ✅ Allow frontend access
-origins = [
-    "https://printready-vectorizer-mvp.vercel.app",
-    "http://localhost:3000"
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"status": "ok"}
 
-@app.head("/health")
-def health_head():
-    return Response(status_code=200)
-
-@app.post("/api/vectorize")
+@app.post("/vectorize")
 async def vectorize(file: UploadFile = File(...)):
+    # Save upload to a temp file
+    fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1] or ".png")
+    os.close(fd)
     try:
-        contents = await file.read()
-        svg_output = vectorize_image(contents)
-        return {"svg": svg_output}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        with open(tmp_path, "wb") as f:
+            f.write(await file.read())
+
+        svg_path = vectorize_image(tmp_path)
+
+        # return the SVG text (or store and return a URL, your call)
+        with open(svg_path, "r", encoding="utf-8") as f:
+            svg_text = f.read()
+
+        return JSONResponse({"svg": svg_text})
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
