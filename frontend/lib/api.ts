@@ -1,58 +1,39 @@
-// frontend/lib/api.ts
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE ??
-  "https://printready-vectorizer-api.onrender.com";
-
+// lib/api.ts
 export type VectorizeOptions = {
-  maxColors: number;
-  smoothness: "low" | "medium" | "high";
-  primitiveSnap: boolean;
+  maxColors: number;          // 1..8
+  primitiveSnap: boolean;     // true/false
 };
 
-export async function vectorizeRequest(
+export async function vectorizeImage(
   file: File,
-  options: VectorizeOptions
+  opts: VectorizeOptions
 ): Promise<string> {
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("max_colors", String(options.maxColors));
-  fd.append("smoothness", options.smoothness);
-  fd.append("primitive_snap", String(!!options.primitiveSnap));
+  const base = process.env.NEXT_PUBLIC_API_BASE;
+  if (!base) throw new Error("Missing NEXT_PUBLIC_API_BASE");
 
-  const res = await fetch(`${API_BASE}/vectorize`, {
+  const url = `${base.replace(/\/$/, "")}/vectorize`;
+
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  fd.append("max_colors", String(opts.maxColors));
+  fd.append("primitive_snap", String(opts.primitiveSnap));
+
+  const res = await fetch(url, {
     method: "POST",
     body: fd,
   });
 
-  // Read once; we’ll decide how to interpret it.
-  const contentType = res.headers.get("content-type") || "";
-  const bodyText = await res.text();
-
   if (!res.ok) {
-    throw new Error(bodyText || `Request failed (${res.status})`);
+    const text = await res.text().catch(() => "");
+    throw new Error(`Vectorize failed: ${res.status} ${text}`);
   }
 
-  // API should return JSON: { svg: "<svg …>" }
-  // But if it ever returns raw SVG, handle that too.
-  if (contentType.includes("application/json")) {
-    let data: any;
-    try {
-      data = JSON.parse(bodyText);
-    } catch {
-      throw new Error("Invalid JSON from server.");
-    }
-    if (!data || typeof data.svg !== "string") {
-      throw new Error("Server did not return an SVG string.");
-    }
-    return data.svg; // ← Already a real SVG string (NOT stringified)
+  // API returns: { svg: "<svg ...>...</svg>" }
+  const data = (await res.json()) as { svg?: string; detail?: unknown };
+  if (!data?.svg || !data.svg.includes("<svg")) {
+    throw new Error(
+      `Unexpected response: ${JSON.stringify(data).slice(0, 400)}`
+    );
   }
-
-  // Fallback: treat whole body as SVG
-  return bodyText;
-}
-
-/** Remove XML declaration / DOCTYPE so mounting via innerHTML is safe. */
-export function normalizeSvg(svg: string): string {
-  const start = svg.search(/<svg[\s\S]*?>/i);
-  return start >= 0 ? svg.slice(start) : svg;
+  return data.svg;
 }
