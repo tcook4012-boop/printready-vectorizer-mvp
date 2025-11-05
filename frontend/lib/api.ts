@@ -1,28 +1,49 @@
 // frontend/lib/api.ts
-export type VectorizeResponse =
-  | { svg: string }
-  | { detail: string };
+const BASE =
+  process.env.NEXT_PUBLIC_API_BASE ||
+  "https://printready-vectorizer-api.onrender.com";
 
-export async function vectorize(
-  apiBase: string,
-  file: File,
-  opts: {
-    max_colors: number;
-    smoothness: string;
-    primitive_snap: boolean;
-  }
-): Promise<VectorizeResponse> {
+export type VectorizeParams = {
+  file: File;
+  maxColors: number;
+  smoothness: "low" | "medium" | "high";
+  // We keep the flag here for UI completeness, but the working backend path is primitive_snap=false
+  primitiveSnap: boolean;
+};
+
+export type VectorizeResponse = {
+  svg: string;
+};
+
+export async function vectorize({
+  file,
+  maxColors,
+  smoothness,
+  primitiveSnap,
+}: VectorizeParams): Promise<VectorizeResponse> {
   const form = new FormData();
-  form.append("file", file);
-  form.append("max_colors", String(opts.max_colors));
-  form.append("smoothness", String(opts.smoothness));
-  form.append("primitive_snap", String(opts.primitive_snap));
+  // IMPORTANT: ensure we send a File (not just a Blob) so FastAPI sees `filename` and content-type
+  form.append("file", file, file.name);
+  form.append("max_colors", String(maxColors));
+  form.append("smoothness", smoothness);
 
-  const res = await fetch(`${apiBase}/vectorize`, {
+  // The working tracer is the potrace path → primitive_snap=false
+  // If/when you implement the primitive route, you can pass the real value instead.
+  form.append("primitive_snap", String(false));
+
+  const res = await fetch(`${BASE}/vectorize`, {
     method: "POST",
     body: form,
   });
 
-  // FastAPI returns JSON for both success and error
-  return res.json();
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Vectorize failed ${res.status}: ${text}`);
+  }
+
+  const data = (await res.json()) as VectorizeResponse;
+
+  // Defensive: normalize SVG string
+  const svg = (data?.svg ?? "").trim();
+  return { svg };
 }
