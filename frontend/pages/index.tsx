@@ -1,163 +1,266 @@
-import React, { useRef, useState } from "react";
+import React, { useMemo, useState } from "react";
 
-const DEFAULT_MAX_COLORS = 8;
+/**
+ * PrintReady Vectorizer (MVP)
+ * Frontend: Next.js Pages Router
+ * Posts a multipart/form-data payload that matches the FastAPI backend.
+ *
+ * Expected backend fields:
+ *   - file                  : image file
+ *   - max_colors            : number/string
+ *   - smoothness            : "low" | "medium" | "high"
+ *   - primitive_snap        : "true" | "false"
+ */
+
+type VectorizeResponse =
+  | { svg: string }                // success
+  | { detail: unknown }            // FastAPI validation/HTTPException
+
+const DEFAULT_API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE?.trim() ||
+  "https://printready-vectorizer-api.onrender.com";
 
 export default function Home() {
-  const fileRef = useRef<HTMLInputElement | null>(null);
-  const [maxColors, setMaxColors] = useState<number>(DEFAULT_MAX_COLORS);
-  const [smoothness, setSmoothness] = useState<"low"|"medium"|"high">("medium");
+  const [file, setFile] = useState<File | null>(null);
+  const [maxColors, setMaxColors] = useState<number>(8);
+  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">(
+    "medium"
+  );
   const [primitiveSnap, setPrimitiveSnap] = useState<boolean>(true);
+  const [hqRefine, setHqRefine] = useState<boolean>(false); // placeholder, not sent to API
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [svg, setSvg] = useState<string>("");
-  const [busy, setBusy] = useState<boolean>(false);
-  const [error, setError] = useState<string>("");
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE; // e.g. https://printready-vectorizer-api.onrender.com
+  const apiBase = useMemo(() => DEFAULT_API_BASE, []);
+  const apiUrl = `${apiBase.replace(/\/+$/, "")}/vectorize`;
 
-  async function onVectorize() {
-    setError("");
+  const onChooseFile: React.ChangeEventHandler<HTMLInputElement> = (e) => {
+    const f = e.currentTarget.files?.[0] ?? null;
+    setFile(f);
     setSvg("");
+    setError(null);
+  };
 
-    const f = fileRef.current?.files?.[0];
-    if (!f) {
-      setError("Please choose a file first.");
-      return;
-    }
-    if (!API_BASE) {
-      setError("NEXT_PUBLIC_API_BASE is not set. In Vercel, go to Settings → Environment Variables and set it to your Render API base URL.");
-      return;
-    }
-
-    setBusy(true);
+  const vectorize = async () => {
     try {
-      const form = new FormData();
-      // IMPORTANT: field names must match the FastAPI endpoint
-      form.append("file", f, f.name);
-      form.append("max_colors", String(maxColors));
-      form.append("smoothness", smoothness);
-      form.append("primitive_snap", String(primitiveSnap));
+      setBusy(true);
+      setError(null);
+      setSvg("");
 
-      const res = await fetch(`${API_BASE}/vectorize`, {
-        method: "POST",
-        body: form,
-      });
-
-      const text = await res.text();
-
-      // Try JSON first; fall back to raw string (helps debug)
-      let data: any = null;
-      try { data = JSON.parse(text); } catch { /* ignore */ }
-
-      if (!res.ok) {
-        setError(data?.detail ? String(data.detail) : `HTTP ${res.status}: ${text}`);
+      if (!file) {
+        setError("Please choose an image first.");
         return;
       }
 
-      const svgText: string = data?.svg ?? "";
-      setSvg(svgText);
+      const form = new FormData();
+      // IMPORTANT: field names must match FastAPI param names:
+      form.append("file", file, file.name);
+      form.append("max_colors", String(maxColors));
+      form.append("smoothness", smoothness);
+      form.append("primitive_snap", primitiveSnap ? "true" : "false");
 
-      // Quick hint if backend returns empty svg
-      if (!svgText || svgText.replace(/\s/g, "").length < 100) {
-        setError("Backend returned an empty/very short SVG. Check the Render logs for /vectorize.");
+      const res = await fetch(apiUrl, {
+        method: "POST",
+        body: form,
+        // Don't set Content-Type; browser will set correct multipart boundary
+      });
+
+      const text = await res.text(); // for easier debugging
+      let json: VectorizeResponse;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(`Non-JSON response from API: ${text.slice(0, 200)}…`);
       }
-    } catch (e: any) {
-      setError(e?.message ?? String(e));
+
+      if (!res.ok) {
+        // FastAPI may return {"detail": ...}
+        const msg =
+          typeof (json as any)?.detail === "string"
+            ? (json as any).detail
+            : JSON.stringify((json as any)?.detail ?? json);
+        throw new Error(`API error (${res.status}): ${msg}`);
+      }
+
+      if ("svg" in json && typeof json.svg === "string") {
+        setSvg(json.svg);
+        if (!json.svg.trim()) {
+          setError("API returned an empty SVG string.");
+        }
+      } else {
+        setError("Unexpected API payload shape.");
+      }
+    } catch (err: any) {
+      setError(err?.message || String(err));
     } finally {
       setBusy(false);
     }
-  }
+  };
+
+  const previewUrl = useMemo(() => (file ? URL.createObjectURL(file) : ""), [file]);
 
   return (
-    <div style={{ maxWidth: 1100, margin: "40px auto", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial" }}>
-      <h1 style={{ fontSize: 36, marginBottom: 8 }}>PrintReady Vectorizer (MVP)</h1>
-      <p style={{ color: "#333", marginBottom: 24 }}>
+    <main style={{ padding: 24, maxWidth: 1200, margin: "0 auto" }}>
+      <h1 style={{ marginBottom: 8 }}>PrintReady Vectorizer (MVP)</h1>
+
+      <p style={{ marginTop: 0, color: "#666" }}>
         Upload a logo/image. This runs a first-party tracer (no Potrace/VTracer).
       </p>
 
-      <div style={{ display: "flex", gap: 24, alignItems: "center", flexWrap: "wrap", marginBottom: 16 }}>
-        <input ref={fileRef} type="file" accept="image/*" />
+      <div style={{ margin: "8px 0 16px", fontSize: 12, color: "#666" }}>
+        Using API: <code>{apiUrl}</code>
+      </div>
+
+      <div style={{ display: "flex", gap: 24, alignItems: "center", flexWrap: "wrap" }}>
         <div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>Max Colors</div>
+          <input type="file" accept="image/*" onChange={onChooseFile} />
+          <div style={{ fontSize: 12, color: "#888" }}>
+            {file ? file.name : "No file selected"}
+          </div>
+        </div>
+
+        <div>
+          <div>Max Colors</div>
           <input
             type="number"
             min={2}
             max={32}
             value={maxColors}
-            onChange={(e) => setMaxColors(Number(e.target.value || DEFAULT_MAX_COLORS))}
-            style={{ width: 72 }}
+            onChange={(e) => setMaxColors(Number(e.target.value) || 8)}
+            style={{ width: 80 }}
           />
         </div>
+
         <div>
-          <div style={{ fontSize: 12, opacity: 0.7 }}>Smoothness</div>
-          <select value={smoothness} onChange={(e) => setSmoothness(e.target.value as any)}>
+          <div>Smoothness</div>
+          <select
+            value={smoothness}
+            onChange={(e) => setSmoothness(e.target.value as any)}
+          >
             <option value="low">low</option>
             <option value="medium">medium</option>
             <option value="high">high</option>
           </select>
         </div>
-        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <input type="checkbox" checked={primitiveSnap} onChange={(e) => setPrimitiveSnap(e.target.checked)} />
+
+        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            type="checkbox"
+            checked={primitiveSnap}
+            onChange={(e) => setPrimitiveSnap(e.target.checked)}
+          />
           Primitive snap
         </label>
+
+        <label style={{ display: "flex", gap: 8, alignItems: "center", opacity: 0.5 }}>
+          <input
+            type="checkbox"
+            checked={hqRefine}
+            onChange={(e) => setHqRefine(e.target.checked)}
+            disabled
+          />
+          HQ refine (placeholder)
+        </label>
+
         <button
-          onClick={onVectorize}
+          onClick={vectorize}
           disabled={busy}
-          style={{
-            padding: "8px 16px",
-            background: "#111",
-            color: "#fff",
-            borderRadius: 6,
-            border: "none",
-            cursor: "pointer",
-          }}
+          style={{ padding: "8px 14px", fontWeight: 600 }}
         >
-          {busy ? "Processing…" : "Vectorize"}
+          {busy ? "Processing..." : "Vectorize"}
         </button>
       </div>
 
-      {!!API_BASE && (
-        <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 16 }}>
-          Using API: <code>{API_BASE}/vectorize</code>
-        </div>
-      )}
-
-      {error && (
-        <div style={{ background: "#fff3cd", border: "1px solid #ffeeba", color: "#856404", padding: 12, borderRadius: 6, marginBottom: 12 }}>
-          {error}
-        </div>
-      )}
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
-        <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24, marginTop: 24 }}>
+        <section>
           <h3>Input Preview</h3>
-          <div style={{ border: "1px solid #ddd", minHeight: 360, display: "grid", placeItems: "center" }}>
-            {/* Simple preview via object URL */}
-            {fileRef.current?.files?.[0] ? (
+          <div
+            style={{
+              minHeight: 300,
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              padding: 8,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "#fafafa",
+            }}
+          >
+            {previewUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
               <img
+                src={previewUrl}
                 alt="preview"
-                src={URL.createObjectURL(fileRef.current.files[0])}
-                style={{ maxWidth: "100%", maxHeight: 480 }}
-                onLoad={(e) => URL.revokeObjectURL((e.target as HTMLImageElement).src)}
+                style={{ maxWidth: "100%", maxHeight: 500 }}
               />
             ) : (
-              <div style={{ opacity: 0.5 }}>No file chosen</div>
+              <div style={{ color: "#aaa" }}>No image selected</div>
             )}
           </div>
-        </div>
+        </section>
 
-        <div style={{ border: "1px solid #eee", borderRadius: 8, padding: 16 }}>
+        <section>
           <h3>Output SVG</h3>
-          <div style={{ minHeight: 360, border: "1px solid #ddd", padding: 12, overflow: "auto" }}>
-            {svg ? (
-              <div
-                // Render the SVG string
-                dangerouslySetInnerHTML={{ __html: svg }}
-              />
-            ) : (
-              <pre style={{ margin: 0, opacity: 0.6 }}>{"(empty)"}</pre>
+          <div
+            style={{
+              minHeight: 300,
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              padding: 8,
+              background: "#fafafa",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+              fontSize: 12,
+            }}
+          >
+            {error && (
+              <div style={{ color: "#c00", marginBottom: 8 }}>
+                Error: {error}
+              </div>
+            )}
+            {!error && !svg && <div style={{ color: "#aaa" }}>No output yet.</div>}
+            {!error && svg && (
+              <>
+                <div style={{ marginBottom: 8, color: "#555" }}>
+                  First 200 chars:
+                </div>
+                <div>{svg.slice(0, 200)}{svg.length > 200 ? "…" : ""}</div>
+                <div style={{ marginTop: 12 }}>
+                  <DownloadButton svg={svg} />
+                </div>
+                <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 8 }}>
+                  <details>
+                    <summary>Full SVG</summary>
+                    <pre style={{ whiteSpace: "pre-wrap" }}>{svg}</pre>
+                  </details>
+                </div>
+              </>
             )}
           </div>
-        </div>
+        </section>
       </div>
-    </div>
+    </main>
+  );
+}
+
+function DownloadButton({ svg }: { svg: string }) {
+  const handleDownload = () => {
+    const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "vectorized.svg";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+  return (
+    <button onClick={handleDownload} style={{ padding: "6px 12px" }}>
+      Download SVG
+    </button>
   );
 }
