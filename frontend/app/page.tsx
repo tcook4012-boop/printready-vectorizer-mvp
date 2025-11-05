@@ -1,75 +1,101 @@
 "use client";
-import React, { useState } from 'react';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
+import { useState } from "react";
 
-export default function Home() {
-  const [file, setFile] = useState<File|null>(null);
-  const [svg, setSvg] = useState<string|null>(null);
-  const [loading, setLoading] = useState(false);
-  const [maxColors, setMaxColors] = useState(8);
-  const [smoothness, setSmoothness] = useState('medium');
-  const [primitiveSnap, setPrimitiveSnap] = useState(true);
-  const [hqRefine, setHqRefine] = useState(false);
+export default function Page() {
+  const [preview, setPreview] = useState<string | null>(null);
+  const [svgOutput, setSvgOutput] = useState<string>("No output yet.");
 
-  const onUpload = async () => {
-    if (!file) return;
-    setLoading(true);
-    const form = new FormData();
-    form.append('file', file);
-    form.append('max_colors', String(maxColors));
-    form.append('smoothness', smoothness);
-    form.append('primitive_snap', String(primitiveSnap));
-    form.append('hq_refine', String(hqRefine));
+  // ✅ Your Render backend
+  const API_BASE = "https://printready-vectorizer-api.onrender.com";
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) setPreview(URL.createObjectURL(file));
+  };
+
+  const vectorize = async () => {
+    const input = document.getElementById("file") as HTMLInputElement;
+    const file = input.files?.[0];
+
+    if (!file) {
+      alert("Please choose an image first!");
+      return;
+    }
+
+    setSvgOutput("Processing...");
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("max_colors", "8");
+    formData.append("smoothness", "medium");
+    formData.append("primitive_snap", "true");
+
     try {
-      const res = await fetch(`${API_BASE}/vectorize`, { method: 'POST', body: form });
-      const text = await res.text();
-      setSvg(text);
-    } catch (e) {
-      alert('Error: ' + (e as Error).message);
-    } finally {
-      setLoading(false);
+      const res = await fetch(`${API_BASE}/vectorize`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`HTTP ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+
+      // ✅ backend returns inline SVG text
+      if (data.svg && typeof data.svg === "string" && data.svg.startsWith("<svg")) {
+        setSvgOutput(data.svg);
+      } else {
+        setSvgOutput("Unexpected response: " + JSON.stringify(data));
+      }
+    } catch (error: any) {
+      setSvgOutput("Error: " + error.message);
     }
   };
 
   return (
-    <main style={{maxWidth:960, margin:'40px auto', fontFamily:'system-ui'}}>
+    <div style={{ fontFamily: "Arial", padding: "30px" }}>
       <h1>PrintReady Vectorizer (MVP)</h1>
-      <p>Upload a logo/image. This runs a first‑party tracer (no Potrace/VTracer).</p>
+      <p>Upload an image and convert it into SVG.</p>
 
-      <div style={{display:'flex', gap:16, alignItems:'center', margin:'12px 0'}}>
-        <input type="file" accept="image/*" onChange={e=>setFile(e.target.files?.[0]||null)} />
-        <label>Max Colors
-          <input type="number" value={maxColors} min={2} max={32} onChange={e=>setMaxColors(parseInt(e.target.value||'8'))} style={{marginLeft:8,width:64}}/>
-        </label>
-        <label>Smoothness
-          <select value={smoothness} onChange={e=>setSmoothness(e.target.value)} style={{marginLeft:8}}>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-          </select>
-        </label>
-        <label>
-          <input type="checkbox" checked={primitiveSnap} onChange={e=>setPrimitiveSnap(e.target.checked)} />
-          Primitive snap
-        </label>
-        <label>
-          <input type="checkbox" checked={hqRefine} onChange={e=>setHqRefine(e.target.checked)} />
-          HQ refine (placeholder)
-        </label>
-        <button onClick={onUpload} disabled={!file || loading}>{loading ? 'Processing...' : 'Vectorize'}</button>
-      </div>
+      <input id="file" type="file" accept="image/*" onChange={handleFile} />
+      <button
+        onClick={vectorize}
+        style={{ marginLeft: 12, padding: "6px 12px", cursor: "pointer" }}
+      >
+        Vectorize
+      </button>
 
-      <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginTop:24}}>
-        <div style={{border:'1px solid #ddd', padding:8}}>
+      <div style={{ display: "flex", marginTop: 25, gap: 30 }}>
+        <div style={{ width: "45%" }}>
           <h3>Input Preview</h3>
-          {file ? <img src={URL.createObjectURL(file)} style={{maxWidth:'100%'}}/> : <div>Choose an image file.</div>}
+          {preview ? (
+            <img
+              src={preview}
+              alt="preview"
+              style={{ maxWidth: "100%", border: "1px solid #ddd" }}
+            />
+          ) : (
+            <span>No file selected</span>
+          )}
         </div>
-        <div style={{border:'1px solid #ddd', padding:8}}>
+
+        <div style={{ width: "45%" }}>
           <h3>Output SVG</h3>
-          {svg ? <div dangerouslySetInnerHTML={{__html: svg}}/> : <div>No output yet.</div>}
+          <div
+            style={{
+              border: "1px solid #ddd",
+              minHeight: "300px",
+              padding: "10px",
+              background: "#fafafa",
+              overflow: "auto",
+            }}
+            dangerouslySetInnerHTML={{ __html: svgOutput }}
+          />
         </div>
       </div>
-    </main>
+    </div>
   );
 }
