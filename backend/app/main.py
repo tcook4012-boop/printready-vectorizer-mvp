@@ -1,14 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 from app.vectorizer.pipeline import vectorize_image
 
 app = FastAPI(title="PrintReady Vectorizer API")
 
-# allow your Vercel app to call this API
+# CORS: adjust the allow_origins to your Vercel app domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to your vercel domain
+    allow_origins=[
+        "https://printready-vectorizer-mvp.vercel.app",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -16,7 +19,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"status": "ok"}
 
 @app.post("/vectorize")
 async def vectorize(
@@ -26,31 +29,19 @@ async def vectorize(
     primitive_snap: bool = Form(True),
 ):
     """
-    Returns: {"svg": "<svg ...>"}  (inline SVG text, not a tmp path)
+    Accepts an uploaded raster, converts to BMP (potrace-friendly), runs potrace,
+    and returns the SVG TEXT (not a temp file path).
     """
     data = await file.read()
-    svg_text = vectorize_image(
-        data=data,
-        max_colors=max_colors,
-        smoothness=smoothness,
-        primitive_snap=primitive_snap,
-    )
-    return JSONResponse({"svg": svg_text})
-
-
-# Optional: simple passthrough to view an SVG string directly (handy for debugging)
-@app.post("/vectorize.svg")
-async def vectorize_svg(
-    file: UploadFile = File(...),
-    max_colors: int = Form(8),
-    smoothness: str = Form("medium"),
-    primitive_snap: bool = Form(True),
-):
-    data = await file.read()
-    svg_text = vectorize_image(
-        data=data,
-        max_colors=max_colors,
-        smoothness=smoothness,
-        primitive_snap=primitive_snap,
-    )
-    return PlainTextResponse(svg_text, media_type="image/svg+xml")
+    try:
+        svg_text = vectorize_image(
+            input_bytes=data,
+            max_colors=max_colors,
+            smoothness=smoothness,
+            primitive_snap=primitive_snap,
+        )
+        # Return SVG string directly so the frontend can display it
+        return JSONResponse({"svg": svg_text})
+    except Exception as e:
+        # Surface a helpful error message to Swagger and the frontend
+        return JSONResponse({"detail": str(e)}, status_code=500)
