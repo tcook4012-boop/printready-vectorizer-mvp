@@ -1,101 +1,118 @@
+// frontend/app/page.tsx
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { normalizeSvg, vectorizeRequest } from "../lib/api";
 
-export default function Page() {
-  const [preview, setPreview] = useState<string | null>(null);
-  const [svgOutput, setSvgOutput] = useState<string>("No output yet.");
+export default function Home() {
+  const fileRef = useRef<HTMLInputElement>(null);
+  const outRef = useRef<HTMLDivElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [downloadHref, setDownloadHref] = useState<string>("");
 
-  // ✅ Your Render backend
-  const API_BASE = "https://printready-vectorizer-api.onrender.com";
-
-  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) setPreview(URL.createObjectURL(file));
-  };
-
-  const vectorize = async () => {
-    const input = document.getElementById("file") as HTMLInputElement;
-    const file = input.files?.[0];
-
-    if (!file) {
-      alert("Please choose an image first!");
+  async function onVectorize() {
+    setError(null);
+    setDownloadHref("");
+    if (!fileRef.current?.files?.[0]) {
+      setError("Please choose an image file first.");
       return;
     }
+    const file = fileRef.current.files[0];
 
-    setSvgOutput("Processing...");
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("max_colors", "8");
-    formData.append("smoothness", "medium");
-    formData.append("primitive_snap", "true");
-
+    setBusy(true);
     try {
-      const res = await fetch(`${API_BASE}/vectorize`, {
-        method: "POST",
-        body: formData,
+      const svgRaw = await vectorizeRequest(file, {
+        maxColors: 8,
+        smoothness: "medium",
+        primitiveSnap: false, // can toggle later in UI
       });
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(`HTTP ${res.status}: ${err}`);
+      const svg = normalizeSvg(svgRaw);
+
+      // Render
+      if (outRef.current) {
+        outRef.current.innerHTML = ""; // clear
+        outRef.current.insertAdjacentHTML("afterbegin", svg);
       }
 
-      const data = await res.json();
-
-      // ✅ backend returns inline SVG text
-      if (data.svg && typeof data.svg === "string" && data.svg.startsWith("<svg")) {
-        setSvgOutput(data.svg);
-      } else {
-        setSvgOutput("Unexpected response: " + JSON.stringify(data));
-      }
-    } catch (error: any) {
-      setSvgOutput("Error: " + error.message);
+      // Enable download
+      const href =
+        "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+      setDownloadHref(href);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+      if (outRef.current) outRef.current.textContent = "";
+    } finally {
+      setBusy(false);
     }
-  };
+  }
 
   return (
-    <div style={{ fontFamily: "Arial", padding: "30px" }}>
+    <main style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
       <h1>PrintReady Vectorizer (MVP)</h1>
-      <p>Upload an image and convert it into SVG.</p>
 
-      <input id="file" type="file" accept="image/*" onChange={handleFile} />
-      <button
-        onClick={vectorize}
-        style={{ marginLeft: 12, padding: "6px 12px", cursor: "pointer" }}
-      >
-        Vectorize
-      </button>
+      <div style={{ margin: "12px 0" }}>
+        <input ref={fileRef} type="file" accept="image/*" />
+        <button onClick={onVectorize} disabled={busy} style={{ marginLeft: 12 }}>
+          {busy ? "Processing…" : "Vectorize"}
+        </button>
+        {downloadHref && (
+          <a
+            href={downloadHref}
+            download="output.svg"
+            style={{ marginLeft: 12 }}
+          >
+            Download SVG
+          </a>
+        )}
+      </div>
 
-      <div style={{ display: "flex", marginTop: 25, gap: 30 }}>
-        <div style={{ width: "45%" }}>
+      {error && (
+        <div style={{ color: "crimson", margin: "8px 0" }}>Error: {error}</div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+        <section>
           <h3>Input Preview</h3>
-          {preview ? (
-            <img
-              src={preview}
-              alt="preview"
-              style={{ maxWidth: "100%", border: "1px solid #ddd" }}
-            />
-          ) : (
-            <span>No file selected</span>
-          )}
-        </div>
-
-        <div style={{ width: "45%" }}>
-          <h3>Output SVG</h3>
           <div
             style={{
+              height: 320,
               border: "1px solid #ddd",
-              minHeight: "300px",
-              padding: "10px",
-              background: "#fafafa",
-              overflow: "auto",
+              display: "grid",
+              placeItems: "center",
+              padding: 12,
             }}
-            dangerouslySetInnerHTML={{ __html: svgOutput }}
+          >
+            {fileRef.current?.files?.[0] ? (
+              <img
+                alt="preview"
+                src={URL.createObjectURL(fileRef.current.files[0])}
+                style={{ maxWidth: "100%", maxHeight: "100%" }}
+                onLoad={(e) =>
+                  URL.revokeObjectURL((e.currentTarget as HTMLImageElement).src)
+                }
+              />
+            ) : (
+              <small>No file selected.</small>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <h3>Output SVG</h3>
+          <div
+            ref={outRef}
+            style={{
+              height: 320,
+              border: "1px solid #ddd",
+              padding: 12,
+              overflow: "auto",
+              background: "#fff",
+            }}
           />
-        </div>
+        </section>
       </div>
-    </div>
+    </main>
   );
 }
