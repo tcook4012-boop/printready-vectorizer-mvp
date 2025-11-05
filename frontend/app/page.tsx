@@ -2,7 +2,7 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { vectorizeImage } from "@/lib/api";
+import { vectorizeImage } from "../lib/api";
 
 export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
