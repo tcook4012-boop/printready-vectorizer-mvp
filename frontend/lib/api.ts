@@ -1,32 +1,37 @@
 // frontend/lib/api.ts
-const BASE =
-  process.env.NEXT_PUBLIC_API_BASE ||
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "") ||
   "https://printready-vectorizer-api.onrender.com";
 
-export type VectorizeParams = {
+export type Smoothness = "low" | "medium" | "high";
+
+export async function vectorize(params: {
   file: File;
-  maxColors: number;
-  smoothness: "low" | "medium" | "high";
-};
+  maxColors?: number;
+  smoothness?: Smoothness;
+}) {
+  const { file, maxColors = 8, smoothness = "medium" } = params;
 
-export type VectorizeResponse = { svg: string };
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("max_colors", String(maxColors));
+  fd.append("smoothness", smoothness);
 
-export async function vectorize({
-  file,
-  maxColors,
-  smoothness,
-}: VectorizeParams): Promise<VectorizeResponse> {
-  const form = new FormData();
-  form.append("file", file, file.name);           // IMPORTANT: keep as File with name
-  form.append("max_colors", String(maxColors));
-  form.append("smoothness", smoothness);
-  form.append("primitive_snap", "false");         // HARD FORCE POTRACE PATH
+  // IMPORTANT: force off until implemented server-side
+  fd.append("primitive_snap", "false");
 
-  const res = await fetch(`${BASE}/vectorize`, { method: "POST", body: form });
+  const res = await fetch(`${API_BASE}/vectorize`, {
+    method: "POST",
+    body: fd,
+  });
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Vectorize failed ${res.status}: ${text}`);
+    const text = await res.text();
+    throw new Error(`API error ${res.status}: ${text}`);
   }
-  const data = (await res.json()) as VectorizeResponse;
-  return { svg: (data?.svg || "").trim() };
+
+  const data = (await res.json()) as { svg?: string };
+  const svg = (data.svg ?? "").trim();
+  if (!svg) throw new Error("Empty SVG from server");
+  return svg;
 }
