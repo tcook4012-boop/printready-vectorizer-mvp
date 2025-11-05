@@ -1,118 +1,182 @@
-// frontend/app/page.tsx
+// app/page.tsx
 "use client";
 
-import { useRef, useState } from "react";
-import { normalizeSvg, vectorizeRequest } from "../lib/api";
+import { useMemo, useRef, useState } from "react";
+import { vectorizeImage } from "@/lib/api";
 
-export default function Home() {
-  const fileRef = useRef<HTMLInputElement>(null);
-  const outRef = useRef<HTMLDivElement>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [downloadHref, setDownloadHref] = useState<string>("");
+export default function HomePage() {
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
-  async function onVectorize() {
-    setError(null);
-    setDownloadHref("");
-    if (!fileRef.current?.files?.[0]) {
-      setError("Please choose an image file first.");
-      return;
-    }
-    const file = fileRef.current.files[0];
+  const [maxColors, setMaxColors] = useState(4);       // default > 1 so you see color
+  const [primitiveSnap, setPrimitiveSnap] = useState(false);
 
-    setBusy(true);
+  const [svgMarkup, setSvgMarkup] = useState<string>("");
+  const [error, setError] = useState<string>("");
+
+  const downloadRef = useRef<HTMLAnchorElement | null>(null);
+
+  const onChoose: React.ChangeEventHandler<HTMLInputElement> = (e) => {
+    const f = e.target.files?.[0] ?? null;
+    setFile(f || null);
+    setSvgMarkup("");
+    setError("");
+
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    if (f) setPreviewUrl(URL.createObjectURL(f));
+    else setPreviewUrl(null);
+  };
+
+  const onVectorize = async () => {
     try {
-      const svgRaw = await vectorizeRequest(file, {
-        maxColors: 8,
-        smoothness: "medium",
-        primitiveSnap: false, // can toggle later in UI
-      });
-
-      const svg = normalizeSvg(svgRaw);
-
-      // Render
-      if (outRef.current) {
-        outRef.current.innerHTML = ""; // clear
-        outRef.current.insertAdjacentHTML("afterbegin", svg);
+      setError("");
+      setSvgMarkup("");
+      if (!file) {
+        setError("Please choose an image file first.");
+        return;
       }
-
-      // Enable download
-      const href =
-        "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
-      setDownloadHref(href);
-    } catch (e: any) {
-      setError(e?.message || String(e));
-      if (outRef.current) outRef.current.textContent = "";
-    } finally {
-      setBusy(false);
+      const svg = await vectorizeImage(file, {
+        maxColors,
+        primitiveSnap,
+      });
+      setSvgMarkup(svg);
+    } catch (err: any) {
+      setError(err?.message ?? String(err));
     }
-  }
+  };
+
+  const downloadHref = useMemo(() => {
+    if (!svgMarkup) return "";
+    const blob = new Blob([svgMarkup], { type: "image/svg+xml" });
+    return URL.createObjectURL(blob);
+  }, [svgMarkup]);
 
   return (
-    <main style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
-      <h1>PrintReady Vectorizer (MVP)</h1>
+    <main style={{ padding: "18px", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 16 }}>
+        PrintReady Vectorizer (MVP)
+      </h1>
 
-      <div style={{ margin: "12px 0" }}>
-        <input ref={fileRef} type="file" accept="image/*" />
-        <button onClick={onVectorize} disabled={busy} style={{ marginLeft: 12 }}>
-          {busy ? "Processing…" : "Vectorize"}
-        </button>
-        {downloadHref && (
+      <div style={{ display: "flex", gap: 24, alignItems: "center", marginBottom: 12 }}>
+        <input type="file" accept="image/*" onChange={onChoose} />
+        <button onClick={onVectorize} style={btnStyle}>Vectorize</button>
+
+        {svgMarkup && (
           <a
+            ref={downloadRef}
             href={downloadHref}
-            download="output.svg"
-            style={{ marginLeft: 12 }}
+            download="vectorized.svg"
+            style={{ color: "#0b5bd3", textDecoration: "underline" }}
           >
             Download SVG
           </a>
         )}
       </div>
 
-      {error && (
-        <div style={{ color: "crimson", margin: "8px 0" }}>Error: {error}</div>
-      )}
+      <fieldset style={panelStyle}>
+        <legend style={legendStyle}>Options</legend>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
-        <section>
-          <h3>Input Preview</h3>
-          <div
-            style={{
-              height: 320,
-              border: "1px solid #ddd",
-              display: "grid",
-              placeItems: "center",
-              padding: 12,
-            }}
+        <label style={labelStyle}>
+          Max Colors:&nbsp;
+          <select
+            value={maxColors}
+            onChange={(e) => setMaxColors(Number(e.target.value))}
           >
-            {fileRef.current?.files?.[0] ? (
-              <img
-                alt="preview"
-                src={URL.createObjectURL(fileRef.current.files[0])}
-                style={{ maxWidth: "100%", maxHeight: "100%" }}
-                onLoad={(e) =>
-                  URL.revokeObjectURL((e.currentTarget as HTMLImageElement).src)
-                }
-              />
+            {[1,2,3,4,5,6,7,8].map(n => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+        </label>
+
+        <label style={labelStyle}>
+          <input
+            type="checkbox"
+            checked={primitiveSnap}
+            onChange={(e) => setPrimitiveSnap(e.target.checked)}
+          />
+          &nbsp;Primitive snap
+        </label>
+
+        <small style={{ color: "#666" }}>
+          Tip: For logos with multiple inks, try 3–6 colors. If edges look ragged,
+          toggle Primitive snap.
+        </small>
+      </fieldset>
+
+      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 24, marginTop: 16 }}>
+        <section>
+          <h3 style={{ marginBottom: 8 }}>Input Preview</h3>
+          <div style={frameStyle}>
+            {previewUrl ? (
+              <img src={previewUrl} style={{ width: "100%", height: "auto" }} alt="preview" />
             ) : (
-              <small>No file selected.</small>
+              <div style={emptyStyle}>No file selected</div>
             )}
           </div>
         </section>
 
         <section>
-          <h3>Output SVG</h3>
-          <div
-            ref={outRef}
-            style={{
-              height: 320,
-              border: "1px solid #ddd",
-              padding: 12,
-              overflow: "auto",
-              background: "#fff",
-            }}
-          />
+          <h3 style={{ marginBottom: 8 }}>Output SVG</h3>
+          <div style={{ ...frameStyle, minHeight: 360 }}>
+            {error && <pre style={errorStyle}>{error}</pre>}
+            {svgMarkup && (
+              <div
+                // render the returned SVG markup
+                dangerouslySetInnerHTML={{ __html: svgMarkup }}
+                style={{ width: "100%", height: "auto" }}
+              />
+            )}
+            {!error && !svgMarkup && <div style={emptyStyle}>No result yet</div>}
+          </div>
         </section>
       </div>
     </main>
   );
 }
+
+const btnStyle: React.CSSProperties = {
+  padding: "8px 12px",
+  borderRadius: 8,
+  border: "1px solid #ccc",
+  background: "#111",
+  color: "#fff",
+  cursor: "pointer",
+};
+
+const panelStyle: React.CSSProperties = {
+  display: "flex",
+  gap: 16,
+  alignItems: "center",
+  padding: 12,
+  borderRadius: 10,
+  border: "1px solid #e5e5e5",
+};
+
+const legendStyle: React.CSSProperties = {
+  fontWeight: 600,
+  padding: "0 6px",
+};
+
+const labelStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+};
+
+const frameStyle: React.CSSProperties = {
+  border: "1px solid #e5e5e5",
+  borderRadius: 10,
+  padding: 10,
+  background: "#fff",
+  overflow: "auto",
+};
+
+const emptyStyle: React.CSSProperties = {
+  color: "#777",
+  fontStyle: "italic",
+};
+
+const errorStyle: React.CSSProperties = {
+  color: "#b00020",
+  whiteSpace: "pre-wrap",
+};
