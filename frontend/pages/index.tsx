@@ -8,7 +8,6 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState<number>(8);
   const [smoothness, setSmoothness] = useState<Smoothness>("medium");
-  const [primitiveSnap, setPrimitiveSnap] = useState<boolean>(false); // default OFF so potrace path runs
   const [svg, setSvg] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
@@ -16,38 +15,20 @@ export default function Home() {
   const imgUrl = useMemo(() => (file ? URL.createObjectURL(file) : ""), [file]);
   const downloadRef = useRef<HTMLAnchorElement | null>(null);
 
-  useEffect(() => {
-    return () => {
-      if (imgUrl) URL.revokeObjectURL(imgUrl);
-    };
-  }, [imgUrl]);
+  useEffect(() => () => { if (imgUrl) URL.revokeObjectURL(imgUrl); }, [imgUrl]);
 
   const onChoose = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setError("");
-    setSvg("");
-    const f = e.target.files?.[0] || null;
-    setFile(f);
+    setError(""); setSvg("");
+    setFile(e.target.files?.[0] || null);
   };
 
   const onVectorize = async () => {
-    setError("");
-    setSvg("");
-    if (!file) {
-      setError("Please choose an image first.");
-      return;
-    }
+    setError(""); setSvg("");
+    if (!file) { setError("Please choose an image first."); return; }
     try {
       setBusy(true);
-      const { svg } = await vectorize({
-        file,
-        maxColors,
-        smoothness,
-        primitiveSnap, // ignored in api.ts for now (forced false)
-      });
-      if (!svg || svg === "" || svg === "<svg/>") {
-        setError("Received an empty SVG. Try another image or different settings.");
-        return;
-      }
+      const { svg } = await vectorize({ file, maxColors, smoothness });
+      if (!svg) { setError("Received an empty SVG."); return; }
       setSvg(svg);
     } catch (err: any) {
       setError(err?.message || "Vectorization failed.");
@@ -63,12 +44,8 @@ export default function Home() {
     const a = downloadRef.current ?? document.createElement("a");
     a.href = url;
     a.download = (file?.name?.replace(/\.[^.]+$/, "") || "vectorized") + ".svg";
-    if (!downloadRef.current) {
-      document.body.appendChild(a);
-      downloadRef.current = a;
-    }
+    if (!downloadRef.current) { document.body.appendChild(a); downloadRef.current = a; }
     a.click();
-    // Let the browser revoke shortly after to avoid flicker
     setTimeout(() => URL.revokeObjectURL(url), 500);
   };
 
@@ -76,113 +53,57 @@ export default function Home() {
     <main style={{ maxWidth: 1180, margin: "40px auto", padding: "0 16px" }}>
       <h1 style={{ marginBottom: 8 }}>PrintReady Vectorizer (MVP)</h1>
       <p style={{ marginTop: 0, color: "#444" }}>
-        Upload a logo/image. This runs a first-party tracer (potrace path).
+        Upload a logo/image. This calls the potrace vectorizer on the backend.
       </p>
 
       <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
         <input type="file" accept="image/*" onChange={onChoose} />
-
-        <label>
-          Max Colors{" "}
-          <input
-            type="number"
-            min={2}
-            max={16}
-            value={maxColors}
-            onChange={(e) => setMaxColors(Number(e.target.value || 8))}
-            style={{ width: 64 }}
-          />
+        <label>Max Colors{" "}
+          <input type="number" min={2} max={16} value={maxColors}
+                 onChange={(e) => setMaxColors(Number(e.target.value || 8))}
+                 style={{ width: 64 }} />
         </label>
-
-        <label>
-          Smoothness{" "}
-          <select
-            value={smoothness}
-            onChange={(e) => setSmoothness(e.target.value as Smoothness)}
-          >
+        <label>Smoothness{" "}
+          <select value={smoothness} onChange={(e) => setSmoothness(e.target.value as Smoothness)}>
             <option value="low">low</option>
             <option value="medium">medium</option>
             <option value="high">high</option>
           </select>
         </label>
-
-        <label title="Placeholder path in backend; leave off for now">
-          <input
-            type="checkbox"
-            checked={primitiveSnap}
-            onChange={(e) => setPrimitiveSnap(e.target.checked)}
-          />{" "}
-            Primitive snap
-        </label>
-
         <button onClick={onVectorize} disabled={busy || !file} style={{ padding: "8px 14px" }}>
           {busy ? "Processing…" : "Vectorize"}
         </button>
-
         <button onClick={onDownload} disabled={!svg} style={{ padding: "8px 14px" }}>
           Download SVG
         </button>
       </div>
 
-      {error ? (
-        <div
-          style={{
-            marginTop: 16,
-            padding: "10px 12px",
-            background: "#ffecec",
-            color: "#b20000",
-            border: "1px solid #f5c2c2",
-            borderRadius: 6,
-          }}
-        >
+      {error && (
+        <div style={{ marginTop: 16, padding: "10px 12px", background: "#ffecec",
+                      color: "#b20000", border: "1px solid #f5c2c2", borderRadius: 6 }}>
           {error}
         </div>
-      ) : null}
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24, marginTop: 24 }}>
         <section style={{ border: "1px solid #ddd", borderRadius: 8, padding: 16 }}>
           <h3 style={{ marginTop: 0 }}>Input Preview</h3>
           {imgUrl ? (
-            <img
-              src={imgUrl}
-              style={{ width: "100%", height: "auto", display: "block", border: "1px solid #eee" }}
-              alt="input preview"
-            />
-          ) : (
-            <div style={{ color: "#777" }}>No image selected.</div>
-          )}
+            <img src={imgUrl} style={{ width: "100%", height: "auto", display: "block",
+                                       border: "1px solid #eee" }} alt="input preview" />
+          ) : <div style={{ color: "#777" }}>No image selected.</div>}
         </section>
 
         <section style={{ border: "1px solid #ddd", borderRadius: 8, padding: 16 }}>
           <h3 style={{ marginTop: 0 }}>Output SVG</h3>
-
-          {/* Render the SVG itself */}
           {svg ? (
-            <div
-              style={{
-                width: "100%",
-                maxHeight: 520,
-                overflow: "auto",
-                border: "1px solid #eee",
-              }}
-              // Safe here because the API returns pure <svg> markup we requested
-              dangerouslySetInnerHTML={{ __html: svg }}
-            />
+            <div style={{ width: "100%", maxHeight: 520, overflow: "auto", border: "1px solid #eee" }}
+                 dangerouslySetInnerHTML={{ __html: svg }} />
           ) : (
             <div style={{ color: "#777" }}>No output yet.</div>
           )}
-
-          {/* Also show the raw JSON for debugging */}
-          <pre
-            style={{
-              marginTop: 12,
-              maxHeight: 200,
-              overflow: "auto",
-              background: "#fafafa",
-              border: "1px solid #eee",
-              padding: 8,
-            }}
-          >
+          <pre style={{ marginTop: 12, maxHeight: 200, overflow: "auto",
+                        background: "#fafafa", border: "1px solid #eee", padding: 8 }}>
             {JSON.stringify({ svg }, null, 2)}
           </pre>
         </section>
