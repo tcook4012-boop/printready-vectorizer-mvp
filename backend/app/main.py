@@ -1,25 +1,28 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from app.vectorizer.pipeline import vectorize_image
 
-app = FastAPI(title="PrintReady Vectorizer API")
+app = FastAPI(title="PrintReady Vectorizer API", version="0.1.0")
 
-# CORS: adjust the allow_origins to your Vercel app domain(s)
+# --- CORS ---
+# Allow your Vercel frontend (add any preview domains if you have them)
+origins = [
+    "https://printready-vectorizer-mvp.vercel.app",
+    # "https://<your-preview>.vercel.app",  # add if needed
+    # You can temporarily allow "*" while testing, then tighten later:
+    "*",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://printready-vectorizer-mvp.vercel.app",
-        "http://localhost:3000",
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/")
+def root():
+    return {"ok": True, "service": "printready-vectorizer-api"}
 
 @app.post("/vectorize")
 async def vectorize(
@@ -29,19 +32,15 @@ async def vectorize(
     primitive_snap: bool = Form(True),
 ):
     """
-    Accepts an uploaded raster, converts to BMP (potrace-friendly), runs potrace,
-    and returns the SVG TEXT (not a temp file path).
+    Accepts a file upload via multipart/form-data and returns an SVG string.
     """
-    data = await file.read()
-    try:
-        svg_text = vectorize_image(
-            input_bytes=data,
-            max_colors=max_colors,
-            smoothness=smoothness,
-            primitive_snap=primitive_snap,
-        )
-        # Return SVG string directly so the frontend can display it
-        return JSONResponse({"svg": svg_text})
-    except Exception as e:
-        # Surface a helpful error message to Swagger and the frontend
-        return JSONResponse({"detail": str(e)}, status_code=500)
+    image_bytes = await file.read()
+
+    svg_text = vectorize_image(
+        image_bytes=image_bytes,          # <-- correct kwarg name
+        max_colors=max_colors,
+        smoothness=smoothness,
+        primitive_snap=primitive_snap,
+    )
+
+    return {"svg": svg_text}
