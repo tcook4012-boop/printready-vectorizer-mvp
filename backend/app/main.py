@@ -1,4 +1,3 @@
-# backend/main.py
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,13 +12,17 @@ app = FastAPI()
 # --- CORS (allow Vercel frontend) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # tighten to your exact domains later
+    allow_origins=["*"],       # tighten to specific domains later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Health ---
+# --- Basic root & health to avoid 404 in logs ---
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
 @app.get("/health")
 def health():
     return PlainTextResponse("ok")
@@ -37,7 +40,6 @@ def quantize_kmeans(img_rgb, k):
     H, W, _ = lin.shape
     flat = lin.reshape(-1, 3)
 
-    # k-means in linear light to preserve mid-tones
     km = KMeans(n_clusters=k, n_init=4, max_iter=50, random_state=0)
     labels = km.fit_predict(flat)
     centers_lin = km.cluster_centers_
