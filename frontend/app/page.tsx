@@ -1,182 +1,108 @@
-// app/page.tsx
 "use client";
+import React, { useState } from "react";
+import { vectorizeImage } from "@/lib/api";
+import { normalizeSvg } from "@/lib/svg";
 
-import { useMemo, useRef, useState } from "react";
-import { vectorizeImage } from "../lib/api";
-
-export default function HomePage() {
+export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-
-  const [maxColors, setMaxColors] = useState(4);       // default > 1 so you see color
+  const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
+  const [smoothness, setSmoothness] = useState<"low"|"medium"|"high">("medium");
+  const [svg, setSvg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const [svgMarkup, setSvgMarkup] = useState<string>("");
-  const [error, setError] = useState<string>("");
-
-  const downloadRef = useRef<HTMLAnchorElement | null>(null);
-
-  const onChoose: React.ChangeEventHandler<HTMLInputElement> = (e) => {
-    const f = e.target.files?.[0] ?? null;
-    setFile(f || null);
-    setSvgMarkup("");
-    setError("");
-
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    if (f) setPreviewUrl(URL.createObjectURL(f));
-    else setPreviewUrl(null);
-  };
-
-  const onVectorize = async () => {
+  const handleVectorize = async () => {
+    if (!file) {
+      setError("Please upload an image");
+      return;
+    }
     try {
-      setError("");
-      setSvgMarkup("");
-      if (!file) {
-        setError("Please choose an image file first.");
-        return;
-      }
-      const svg = await vectorizeImage(file, {
+      setError(null);
+      setLoading(true);
+
+      const rawSvg = await vectorizeImage(file, {
         maxColors,
         primitiveSnap,
+        smoothness,
+        minPathArea: 0.0005,
       });
-      setSvgMarkup(svg);
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+
+      const cleaned = normalizeSvg(rawSvg);
+      setSvg(cleaned);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const downloadHref = useMemo(() => {
-    if (!svgMarkup) return "";
-    const blob = new Blob([svgMarkup], { type: "image/svg+xml" });
-    return URL.createObjectURL(blob);
-  }, [svgMarkup]);
+  const downloadSvg = () => {
+    if (!svg) return;
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "output.svg";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
-    <main style={{ padding: "18px", fontFamily: "Inter, system-ui, sans-serif" }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 16 }}>
-        PrintReady Vectorizer (MVP)
-      </h1>
+    <main style={{ padding: 20 }}>
+      <h1>PrintReady Vectorizer</h1>
 
-      <div style={{ display: "flex", gap: 24, alignItems: "center", marginBottom: 12 }}>
-        <input type="file" accept="image/*" onChange={onChoose} />
-        <button onClick={onVectorize} style={btnStyle}>Vectorize</button>
+      <input
+        type="file"
+        accept="image/*"
+        onChange={e => setFile(e.target.files?.[0] || null)}
+      />
 
-        {svgMarkup && (
-          <a
-            ref={downloadRef}
-            href={downloadHref}
-            download="vectorized.svg"
-            style={{ color: "#0b5bd3", textDecoration: "underline" }}
-          >
-            Download SVG
-          </a>
-        )}
+      <div style={{ margin: "10px 0" }}>
+        <label>Max Colors (2-8): </label>
+        <input
+          type="number"
+          min={2}
+          max={8}
+          value={maxColors}
+          onChange={e => setMaxColors(Number(e.target.value))}
+        />
       </div>
 
-      <fieldset style={panelStyle}>
-        <legend style={legendStyle}>Options</legend>
+      <div>
+        <label>Smoothness: </label>
+        <select value={smoothness} onChange={e => setSmoothness(e.target.value as any)}>
+          <option value="low">Low (faster, sharper)</option>
+          <option value="medium">Medium</option>
+          <option value="high">High (smoother curves)</option>
+        </select>
+      </div>
 
-        <label style={labelStyle}>
-          Max Colors:&nbsp;
-          <select
-            value={maxColors}
-            onChange={(e) => setMaxColors(Number(e.target.value))}
-          >
-            {[1,2,3,4,5,6,7,8].map(n => (
-              <option key={n} value={n}>{n}</option>
-            ))}
-          </select>
-        </label>
-
-        <label style={labelStyle}>
+      <div>
+        <label>
           <input
             type="checkbox"
             checked={primitiveSnap}
-            onChange={(e) => setPrimitiveSnap(e.target.checked)}
+            onChange={e => setPrimitiveSnap(e.target.checked)}
           />
-          &nbsp;Primitive snap
+          Primitive Snap
         </label>
-
-        <small style={{ color: "#666" }}>
-          Tip: For logos with multiple inks, try 3–6 colors. If edges look ragged,
-          toggle Primitive snap.
-        </small>
-      </fieldset>
-
-      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 24, marginTop: 16 }}>
-        <section>
-          <h3 style={{ marginBottom: 8 }}>Input Preview</h3>
-          <div style={frameStyle}>
-            {previewUrl ? (
-              <img src={previewUrl} style={{ width: "100%", height: "auto" }} alt="preview" />
-            ) : (
-              <div style={emptyStyle}>No file selected</div>
-            )}
-          </div>
-        </section>
-
-        <section>
-          <h3 style={{ marginBottom: 8 }}>Output SVG</h3>
-          <div style={{ ...frameStyle, minHeight: 360 }}>
-            {error && <pre style={errorStyle}>{error}</pre>}
-            {svgMarkup && (
-              <div
-                // render the returned SVG markup
-                dangerouslySetInnerHTML={{ __html: svgMarkup }}
-                style={{ width: "100%", height: "auto" }}
-              />
-            )}
-            {!error && !svgMarkup && <div style={emptyStyle}>No result yet</div>}
-          </div>
-        </section>
       </div>
+
+      <button onClick={handleVectorize} disabled={loading}>
+        {loading ? "Processing..." : "Vectorize"}
+      </button>
+
+      {error && <p style={{ color: "red" }}>{error}</p>}
+
+      {svg && (
+        <>
+          <h3>Output:</h3>
+          <div style={{ border: "1px solid #999", width: "500px", height: "500px" }}
+               dangerouslySetInnerHTML={{ __html: svg }} />
+          <button onClick={downloadSvg}>Download SVG</button>
+        </>
+      )}
     </main>
   );
 }
-
-const btnStyle: React.CSSProperties = {
-  padding: "8px 12px",
-  borderRadius: 8,
-  border: "1px solid #ccc",
-  background: "#111",
-  color: "#fff",
-  cursor: "pointer",
-};
-
-const panelStyle: React.CSSProperties = {
-  display: "flex",
-  gap: 16,
-  alignItems: "center",
-  padding: 12,
-  borderRadius: 10,
-  border: "1px solid #e5e5e5",
-};
-
-const legendStyle: React.CSSProperties = {
-  fontWeight: 600,
-  padding: "0 6px",
-};
-
-const labelStyle: React.CSSProperties = {
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 6,
-};
-
-const frameStyle: React.CSSProperties = {
-  border: "1px solid #e5e5e5",
-  borderRadius: 10,
-  padding: 10,
-  background: "#fff",
-  overflow: "auto",
-};
-
-const emptyStyle: React.CSSProperties = {
-  color: "#777",
-  fontStyle: "italic",
-};
-
-const errorStyle: React.CSSProperties = {
-  color: "#b00020",
-  whiteSpace: "pre-wrap",
-};
