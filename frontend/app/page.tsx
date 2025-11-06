@@ -1,6 +1,5 @@
 "use client";
 import React, { useState } from "react";
-// ⬇️ use RELATIVE paths instead of "@/..."
 import { vectorizeImage } from "../lib/api";
 import { normalizeSvg } from "../lib/svg";
 
@@ -32,7 +31,12 @@ export default function Home() {
       const cleaned = normalizeSvg(rawSvg);
       setSvg(cleaned);
     } catch (e: any) {
-      setError(e.message);
+      const msg = String(e?.message || e);
+      setError(
+        msg.includes("Failed to fetch")
+          ? "Could not reach the API. Check NEXT_PUBLIC_API_BASE."
+          : msg
+      );
     } finally {
       setLoading(false);
     }
@@ -50,7 +54,7 @@ export default function Home() {
   };
 
   return (
-    <main style={{ padding: 20 }}>
+    <main style={{ padding: 20, maxWidth: 900 }}>
       <h1>PrintReady Vectorizer</h1>
 
       <input
@@ -72,10 +76,7 @@ export default function Home() {
 
       <div>
         <label>Smoothness: </label>
-        <select
-          value={smoothness}
-          onChange={(e) => setSmoothness(e.target.value as any)}
-        >
+        <select value={smoothness} onChange={(e) => setSmoothness(e.target.value as any)}>
           <option value="low">Low (faster, sharper)</option>
           <option value="medium">Medium</option>
           <option value="high">High (smoother curves)</option>
@@ -103,10 +104,18 @@ export default function Home() {
         <>
           <h3>Output:</h3>
           <div
-            style={{ border: "1px solid #999", width: "500px", height: "500px" }}
+            style={{
+              border: "1px solid #999",
+              width: 600,
+              height: 500,
+              overflow: "hidden",
+              background: "#fff",
+            }}
             dangerouslySetInnerHTML={{ __html: svg }}
           />
-          <button onClick={downloadSvg}>Download SVG</button>
+          <button onClick={downloadSvg} style={{ marginTop: 8 }}>
+            Download SVG
+          </button>
         </>
       )}
     </main>
