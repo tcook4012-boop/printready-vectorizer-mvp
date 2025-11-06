@@ -1,124 +1,100 @@
 // frontend/lib/svg.ts
+// Fits any incoming <svg> to its true bounding box so nothing is clipped.
+// Strategy:
+//  - Keep existing viewBox if present (assume backend set it correctly).
+//  - Otherwise, measure the geometry in a hidden <svg> in the DOM (getBBox())
+//    and set viewBox="minX minY width height".
+//  - Make the SVG responsive (width/height 100%, preserveAspectRatio meet).
+//  - Strip noisy attrs; don't invent transforms.
+
 export function normalizeSvg(raw: string) {
-  // Parse XML
   const parser = new DOMParser();
   const doc = parser.parseFromString(raw, "image/svg+xml");
-  const svg = doc.documentElement;
 
-  // Ensure valid root tag
+  const svg = doc.documentElement;
   if (svg.tagName.toLowerCase() !== "svg") {
     throw new Error("normalizeSvg: not an <svg> root");
   }
 
-  // Remove width/height (use viewBox + 100%)
+  // Always make responsive
   svg.removeAttribute("width");
   svg.removeAttribute("height");
-
-  // Ensure viewBox
-  const vb = svg.getAttribute("viewBox");
-  if (!vb) {
-    // Try to infer from paths’ bounding box; fallback to 0..1000 if unknown
-    const bbox = computeBBox(doc);
-    svg.setAttribute("viewBox", `${bbox.x} ${bbox.y} ${bbox.w} ${bbox.h}`);
-  }
-
-  // Enforce responsive sizing + sane aspect ratio handling
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   svg.setAttribute("width", "100%");
   svg.setAttribute("height", "100%");
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
 
-  // Remove suspicious global transforms on <svg> or top-level <g>
+  // If a viewBox already exists, keep it (assume backend was correct)
+  const alreadyHasVB = !!svg.getAttribute("viewBox");
+
+  // Remove suspicious transforms on the root and direct <g>
   svg.removeAttribute("transform");
-  const rootGs = Array.from(svg.children).filter(n => n.nodeName === "g");
-  rootGs.forEach((g: Element) => {
-    if (g.hasAttribute("transform")) {
-      // Don’t attempt to mathematically bake transforms (slow on client).
-      // Instead, wrap into a group-neutral state by moving transform down to children if safe,
-      // or drop it if it’s a pure translate/scale that breaks framing.
-      const t = g.getAttribute("transform") || "";
-      if (/^translate\(\s*0[, ]\s*0\s*\)\s*$/.test(t)) {
-        g.removeAttribute("transform");
-      }
-      // If it's a giant scale that causes black fills across canvas, drop it.
-      if (/scale\(\s*(?:-?\d+(\.\d+)?e?\-?\d*)\s*(?:[, ]\s*(-?\d+(\.\d+)?e?\-?\d*))?\s*\)/i.test(t)) {
-        g.removeAttribute("transform");
-      }
+  Array.from(svg.children).forEach((child) => {
+    if (child.nodeName.toLowerCase() === "g") {
+      (child as Element).removeAttribute("transform");
     }
   });
 
-  // Sort layers by fill luminance to improve stacking (optional but helps)
-  sortPathsByLuminance(svg);
+  // Strip rarely helpful rendering hints that sometimes break previews
+  stripAttrsDeep(svg, ["shape-rendering", "image-rendering", "color-rendering"]);
 
-  // Strip obviously invalid attributes that sometimes appear
-  stripNoisyAttrs(svg, ["shape-rendering", "image-rendering", "color-rendering"]);
+  if (!alreadyHasVB) {
+    // We need to measure the true bounds in the browser.
+    // Create a temporary measuring container off-screen.
+    const temp = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    temp.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    temp.style.position = "absolute";
+    temp.style.visibility = "hidden";
+    temp.style.pointerEvents = "none";
+    temp.style.width = "0";
+    temp.style.height = "0";
 
+    // Import the nodes from the parsed doc into the live DOM <svg>
+    // We clone the root's children into the temp container for measurement.
+    while (svg.attributes.length > 0) svg.removeAttribute(svg.attributes[0].name);
+    const originalChildren = Array.from(doc.documentElement.childNodes);
+    const liveGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    originalChildren.forEach((n) => {
+      const imported = document.importNode(n, true);
+      liveGroup.appendChild(imported);
+    });
+    temp.appendChild(liveGroup);
+    document.body.appendChild(temp);
+
+    // Measure
+    let bbox;
+    try {
+      // getBBox works only when in the live DOM
+      const b = (liveGroup as unknown as SVGGraphicsElement).getBBox();
+      bbox = { x: b.x, y: b.y, w: b.width, h: b.height };
+    } catch {
+      // Last-resort fallback if measurement fails
+      bbox = { x: 0, y: 0, w: 1000, h: 1000 };
+    }
+
+    // Build a fresh root <svg> with correct viewBox and responsive size
+    const newRoot = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    newRoot.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    newRoot.setAttribute("viewBox", `${bbox.x} ${bbox.y} ${bbox.w} ${bbox.h}`);
+    newRoot.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    newRoot.setAttribute("width", "100%");
+    newRoot.setAttribute("height", "100%");
+
+    // Move measured content into the new root
+    newRoot.appendChild(liveGroup);
+
+    // Serialize and clean up
+    const serializer = new XMLSerializer();
+    const out = serializer.serializeToString(newRoot);
+    document.body.removeChild(temp);
+    return out;
+  }
+
+  // Serialize when original viewBox already existed
   const serializer = new XMLSerializer();
   return serializer.serializeToString(svg);
 }
 
-function computeBBox(doc: Document) {
-  // Heuristic bbox; if paths lack bbox we fall back to 0..1000
-  const paths = Array.from(doc.getElementsByTagName("path"));
-  const rects = Array.from(doc.getElementsByTagName("rect"));
-  const circles = Array.from(doc.getElementsByTagName("circle"));
-  const ellipses = Array.from(doc.getElementsByTagName("ellipse"));
-  const polys = Array.from(doc.getElementsByTagName("polygon"));
-  const lines = Array.from(doc.getElementsByTagName("line"));
-
-  // If no geometry, fallback
-  if (
-    paths.length + rects.length + circles.length + ellipses.length + polys.length + lines.length === 0
-  ) {
-    return { x: 0, y: 0, w: 1000, h: 1000 };
-  }
-  // Without computing true path bbox (expensive), give a stable viewBox
-  // that won’t clip: 0..1000. Backends should set an accurate viewBox later.
-  return { x: 0, y: 0, w: 1000, h: 1000 };
-}
-
-function stripNoisyAttrs(el: Element, names: string[]) {
-  names.forEach(n => el.removeAttribute(n));
-  Array.from(el.children).forEach(c => stripNoisyAttrs(c as Element, names));
-}
-
-function sortPathsByLuminance(svg: Element) {
-  const nodes = Array.from(svg.querySelectorAll("path,polygon,polyline,rect,circle,ellipse"));
-  const entries = nodes.map(n => {
-    const fill = (n.getAttribute("fill") || "#000").trim();
-    const lum = hexOrRgbToLum(fill);
-    return { n, lum };
-  });
-  // Light-to-dark (or flip if your outputs look better reversed)
-  entries.sort((a, b) => a.lum - b.lum);
-  // Re-append in order
-  entries.forEach(e => e.n.parentElement?.appendChild(e.n));
-}
-
-function hexOrRgbToLum(c: string) {
-  // Accepts #rgb/#rrggbb or rgb(a)
-  let r = 0, g = 0, b = 0;
-  if (c.startsWith("#")) {
-    const hex = c.slice(1);
-    if (hex.length === 3) {
-      r = parseInt(hex[0] + hex[0], 16);
-      g = parseInt(hex[1] + hex[1], 16);
-      b = parseInt(hex[2] + hex[2], 16);
-    } else if (hex.length >= 6) {
-      r = parseInt(hex.slice(0, 2), 16);
-      g = parseInt(hex.slice(2, 4), 16);
-      b = parseInt(hex.slice(4, 6), 16);
-    }
-  } else if (c.startsWith("rgb")) {
-    const m = c.match(/rgb[a]?\(([^)]+)\)/i);
-    if (m) {
-      const parts = m[1].split(",").map(s => parseFloat(s));
-      [r, g, b] = parts;
-    }
-  }
-  // sRGB luminance
-  const [R, G, B] = [r, g, b].map(v => {
-    const x = v / 255;
-    return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
-  });
-  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+function stripAttrsDeep(el: Element, names: string[]) {
+  names.forEach((n) => el.removeAttribute(n));
+  Array.from(el.children).forEach((c) => stripAttrsDeep(c as Element, names));
 }
