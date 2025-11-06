@@ -1,97 +1,78 @@
 // frontend/lib/svg.ts
-// Fits any incoming <svg> to its true bounding box so nothing is clipped.
-// Strategy:
-//  - Keep existing viewBox if present (assume backend set it correctly).
-//  - Otherwise, measure the geometry in a hidden <svg> in the DOM (getBBox())
-//    and set viewBox="minX minY width height".
-//  - Make the SVG responsive (width/height 100%, preserveAspectRatio meet).
-//  - Strip noisy attrs; don't invent transforms.
+// Robust SVG normalizer:
+// 1) Parse raw SVG.
+// 2) Mount a copy in the DOM, call getBBox() to get true bounds.
+// 3) Build a fresh root with viewBox="0 0 w h" and translate(-minX, -minY).
+// 4) Responsive width/height and sane aspect ratio.
+// This ensures the entire drawing is visible (no more “only a corner”).
 
 export function normalizeSvg(raw: string) {
+  // Parse twice: one copy for measuring, one for final output
   const parser = new DOMParser();
-  const doc = parser.parseFromString(raw, "image/svg+xml");
+  const measureDoc = parser.parseFromString(raw, "image/svg+xml");
+  const outputDoc = parser.parseFromString(raw, "image/svg+xml");
 
-  const svg = doc.documentElement;
-  if (svg.tagName.toLowerCase() !== "svg") {
+  const measureSvg = measureDoc.documentElement;
+  const outputSvg = outputDoc.documentElement;
+
+  if (measureSvg.tagName.toLowerCase() !== "svg") {
     throw new Error("normalizeSvg: not an <svg> root");
   }
 
-  // Always make responsive
-  svg.removeAttribute("width");
-  svg.removeAttribute("height");
-  svg.setAttribute("width", "100%");
-  svg.setAttribute("height", "100%");
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  // Put the measuring SVG into the DOM so getBBox works
+  const tempContainer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  tempContainer.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  tempContainer.style.position = "absolute";
+  tempContainer.style.left = "-99999px";
+  tempContainer.style.top = "-99999px";
+  tempContainer.style.width = "1px";
+  tempContainer.style.height = "1px";
+  tempContainer.style.visibility = "hidden";
 
-  // If a viewBox already exists, keep it (assume backend was correct)
-  const alreadyHasVB = !!svg.getAttribute("viewBox");
+  // Append the parsed SVG to the temp container
+  // Use importNode to create real DOM nodes
+  const measureNode = document.importNode(measureSvg, true);
+  tempContainer.appendChild(measureNode);
+  document.body.appendChild(tempContainer);
 
-  // Remove suspicious transforms on the root and direct <g>
-  svg.removeAttribute("transform");
-  Array.from(svg.children).forEach((child) => {
-    if (child.nodeName.toLowerCase() === "g") {
-      (child as Element).removeAttribute("transform");
-    }
-  });
-
-  // Strip rarely helpful rendering hints that sometimes break previews
-  stripAttrsDeep(svg, ["shape-rendering", "image-rendering", "color-rendering"]);
-
-  if (!alreadyHasVB) {
-    // We need to measure the true bounds in the browser.
-    // Create a temporary measuring container off-screen.
-    const temp = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    temp.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-    temp.style.position = "absolute";
-    temp.style.visibility = "hidden";
-    temp.style.pointerEvents = "none";
-    temp.style.width = "0";
-    temp.style.height = "0";
-
-    // Import the nodes from the parsed doc into the live DOM <svg>
-    // We clone the root's children into the temp container for measurement.
-    while (svg.attributes.length > 0) svg.removeAttribute(svg.attributes[0].name);
-    const originalChildren = Array.from(doc.documentElement.childNodes);
-    const liveGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    originalChildren.forEach((n) => {
-      const imported = document.importNode(n, true);
-      liveGroup.appendChild(imported);
-    });
-    temp.appendChild(liveGroup);
-    document.body.appendChild(temp);
-
-    // Measure
-    let bbox;
-    try {
-      // getBBox works only when in the live DOM
-      const b = (liveGroup as unknown as SVGGraphicsElement).getBBox();
-      bbox = { x: b.x, y: b.y, w: b.width, h: b.height };
-    } catch {
-      // Last-resort fallback if measurement fails
-      bbox = { x: 0, y: 0, w: 1000, h: 1000 };
-    }
-
-    // Build a fresh root <svg> with correct viewBox and responsive size
-    const newRoot = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    newRoot.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-    newRoot.setAttribute("viewBox", `${bbox.x} ${bbox.y} ${bbox.w} ${bbox.h}`);
-    newRoot.setAttribute("preserveAspectRatio", "xMidYMid meet");
-    newRoot.setAttribute("width", "100%");
-    newRoot.setAttribute("height", "100%");
-
-    // Move measured content into the new root
-    newRoot.appendChild(liveGroup);
-
-    // Serialize and clean up
-    const serializer = new XMLSerializer();
-    const out = serializer.serializeToString(newRoot);
-    document.body.removeChild(temp);
-    return out;
+  // Compute true bounds
+  let bbox = { x: 0, y: 0, w: 1000, h: 1000 };
+  try {
+    const b = (measureNode as unknown as SVGGraphicsElement).getBBox();
+    bbox = { x: b.x, y: b.y, w: b.width || 1000, h: b.height || 1000 };
+  } catch {
+    // keep fallback
   }
 
-  // Serialize when original viewBox already existed
+  // Clean up measuring DOM
+  document.body.removeChild(tempContainer);
+
+  // Build a fresh root with 0-based viewBox
+  const cleanRoot = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  cleanRoot.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  cleanRoot.setAttribute("viewBox", `0 0 ${bbox.w} ${bbox.h}`);
+  cleanRoot.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  cleanRoot.setAttribute("width", "100%");
+  cleanRoot.setAttribute("height", "100%");
+
+  // Wrapper group to shift content into the 0-based viewBox
+  const wrapper = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  // Translate content so minX/minY are at (0,0)
+  wrapper.setAttribute("transform", `translate(${-bbox.x}, ${-bbox.y})`);
+
+  // Move children from outputSvg into the wrapper (preserve original content)
+  while (outputSvg.firstChild) {
+    wrapper.appendChild(outputSvg.firstChild);
+  }
+
+  // Strip noisy attributes on the wrapper tree
+  stripAttrsDeep(wrapper, ["shape-rendering", "image-rendering", "color-rendering", "transform-origin"]);
+
+  cleanRoot.appendChild(wrapper);
+
+  // Serialize
   const serializer = new XMLSerializer();
-  return serializer.serializeToString(svg);
+  return serializer.serializeToString(cleanRoot);
 }
 
 function stripAttrsDeep(el: Element, names: string[]) {
