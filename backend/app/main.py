@@ -1,17 +1,16 @@
-# backend/app/main.py  (or backend/main.py depending on your layout)
-
-import io
-import math
-from typing import List, Tuple
-
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
+# backend/app/main.py
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
+import numpy as np
+import cv2
+from sklearn.cluster import KMeans
+from io import BytesIO
+from PIL import Image
 
-app = FastAPI(title="PrintReady Vectorizer API")
+app = FastAPI()
 
+# allow your Vercel frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,139 +21,199 @@ app.add_middleware(
 
 # ---------- helpers ----------
 
-def to_rgb(img_bgr: np.ndarray) -> np.ndarray:
-    if img_bgr.ndim == 2:
-        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+def _read_image(file_bytes: bytes) -> np.ndarray:
+    # PIL ensures weird encodings still load; keep alpha if present then drop later
+    img = Image.open(BytesIO(file_bytes)).convert("RGBA")
+    # flatten alpha onto white to avoid holes in contours
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    img = Image.alpha_composite(bg, img).convert("RGB")
+    arr = np.array(img)  # RGB
+    return arr
 
-def roughly_monochrome(rgb: np.ndarray, tol: float = 0.015) -> bool:
-    ch = [rgb[..., 0], rgb[..., 1], rgb[..., 2]]
-    stds = [np.std(c.astype(np.float32)/255.0) for c in ch]
-    return max(stds) < tol
+def _resize_max(img: np.ndarray, max_side: int = 1600) -> tuple[np.ndarray, float]:
+    h, w = img.shape[:2]
+    scale = 1.0
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return img, scale
 
-def auto_bg_fg(rgb: np.ndarray) -> Tuple[int, int]:
-    # kmeans to 3 clusters; pick largest cluster as background, darkest as foreground
-    Z = rgb.reshape(-1, 3).astype(np.float32)
-    K = 3
-    _, labels, centers = cv2.kmeans(
-        Z, K, None,
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.2),
-        2,
-        cv2.KMEANS_PP_CENTERS
-    )
-    centers = centers.astype(np.float32)
-    labels = labels.reshape(-1)
-    counts = np.bincount(labels, minlength=K)
-    bg_idx = int(np.argmax(counts))
-    luma = (0.2126*centers[:,0] + 0.7152*centers[:,1] + 0.0722*centers[:,2])
-    fg_idx = int(np.argmin(luma))
-    return bg_idx, fg_idx
+def _to_svg_path(contour: np.ndarray, scale_back: float) -> str:
+    # contour is Nx1x2 float/int; scale back to original pixels
+    pts = contour.reshape(-1, 2) / scale_back
+    # M x,y  L x,y ... Z
+    cmds = []
+    for i, (x, y) in enumerate(pts):
+        if i == 0:
+            cmds.append(f"M {x:.2f} {y:.2f}")
+        else:
+            cmds.append(f"L {x:.2f} {y:.2f}")
+    cmds.append("Z")
+    return " ".join(cmds)
 
-def vectorize_core(
-    rgb: np.ndarray,
-    max_colors: int,
-    primitive_snap: bool,
-    min_area_frac: float,
-    layer_order: str
-) -> str:
-    h, w = rgb.shape[:2]
+def _smooth_epsilon(perimeter: float, smoothness: str) -> float:
+    # match your UI dropdown
+    s = (smoothness or "Low").lower()
+    if "high" in s:
+        frac = 0.01    # smoother curves, more simplification
+    elif "medium" in s:
+        frac = 0.005
+    else:  # low (faster, sharper)
+        frac = 0.0025
+    return max(0.5, perimeter * frac)
 
-    # If nearly monochrome, simplify to black/white first
-    if roughly_monochrome(rgb):
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        thr = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)[1]
-        palette = np.array([[0,0,0], [255,255,255]], dtype=np.uint8)
-        labels = (thr == 0).astype(np.int32)
-        unique = 2
-    else:
-        # kmeans palette
-        Z = rgb.reshape(-1, 3).astype(np.float32)
-        K = int(np.clip(max_colors, 2, 8))
-        _, labels, centers = cv2.kmeans(
-            Z, K, None,
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.2),
-            3,
-            cv2.KMEANS_PP_CENTERS
+def _binary_mask_from_gray(gray: np.ndarray) -> np.ndarray:
+    # Otsu binarization (text/graphics friendly)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Detect background by sampling the border; if border is dark, invert so background is white
+    border = np.concatenate([
+        mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1]
+    ])
+    border_dark_ratio = (border < 128).mean()
+    if border_dark_ratio > 0.5:
+        mask = 255 - mask
+
+    # If mask is almost empty/full, fall back to adaptive
+    white_ratio = (mask > 128).mean()
+    if white_ratio < 0.02 or white_ratio > 0.98:
+        adap = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 5
         )
-        palette = centers.astype(np.uint8)
-        labels = labels.reshape(h, w).astype(np.int32)
-        unique = K
+        # choose the variant whose border looks white
+        border2 = np.concatenate([adap[0, :], adap[-1, :], adap[:, 0], adap[:, -1]])
+        if (border2 < 128).mean() <= 0.5:
+            mask = adap
 
-    if layer_order.lower().startswith("dark"):
-        order = np.argsort(
-            (0.2126*palette[:,0] + 0.7152*palette[:,1] + 0.0722*palette[:,2])
-        )  # darkest -> lightest
-    else:
-        order = np.argsort(
-            (0.2126*palette[:,0] + 0.7152*palette[:,1] + 0.0722*palette[:,2])
-        )[::-1]  # lightest -> darkest
+    return mask
 
-    min_area = max(1, int(min_area_frac * h * w))
+def _quantize_lab(img_rgb: np.ndarray, k: int, rnd: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    # Convert RGB to Lab for perceptual clustering
+    img_lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    h, w = img_lab.shape[:2]
+    flat = img_lab.reshape(-1, 3).astype(np.float32)
 
-    paths: List[str] = []
-    for idx in order:
-        mask = (labels == int(idx)).astype(np.uint8) * 255
+    kmeans = KMeans(n_clusters=k, n_init=4, random_state=rnd, max_iter=200)
+    labels = kmeans.fit_predict(flat)
+    centers = kmeans.cluster_centers_.astype(np.float32)
 
-        if primitive_snap:
-            kernel = np.ones((3,3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # back to RGB palette for rendering
+    centers_lab = centers.reshape(-1, 1, 3)
+    centers_rgb = cv2.cvtColor(centers_lab, cv2.COLOR_Lab2RGB).reshape(-1, 3)
+    centers_rgb = np.clip(centers_rgb, 0, 255).astype(np.uint8)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    label_img = labels.reshape(h, w)
+    return label_img, centers_rgb
 
-        for c in contours:
-            if cv2.contourArea(c) < min_area:
-                continue
-            perim = max(1.0, cv2.arcLength(c, True))
-            eps = 0.003 * perim  # tight
-            approx = cv2.approxPolyDP(c, eps, True)
-            if len(approx) < 3:
-                continue
-            d = " ".join(f"L {p[0][0]} {p[0][1]}" for p in approx[1:])
-            d = f"M {approx[0][0][0]} {approx[0][0][1]} {d} Z"
-            R, G, B = map(int, palette[idx])
-            paths.append(
-                f'<path d="{d}" fill="rgb({R},{G},{B})" stroke="none"/>'
-            )
+def _layer_order_indices(centers_rgb: np.ndarray, order: str) -> list[int]:
+    # Order by luminance (Y’ from Rec.601)
+    def luma(c):
+        r, g, b = c
+        return 0.299 * r + 0.587 * g + 0.114 * b
 
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
-        + "".join(paths) +
-        "</svg>"
-    )
-    return svg
+    idxs = list(range(len(centers_rgb)))
+    idxs.sort(key=lambda i: luma(centers_rgb[i]), reverse=("dark" in (order or "").lower()))
+    return idxs
 
-# ---------- routes ----------
+# ---------- SVG builders ----------
+
+def _svg_header(w: int, h: int) -> str:
+    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" shape-rendering="geometricPrecision">'
+
+def _svg_footer() -> str:
+    return "</svg>"
+
+def _svg_color(rgb: np.ndarray) -> str:
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+def _contours_to_paths(mask: np.ndarray, min_area_px: float, smoothness: str, scale_back: float) -> list[str]:
+    # Extract contours (external + holes)
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    paths = []
+    if hierarchy is None:
+        return paths
+
+    h = hierarchy[0]
+    for i, cnt in enumerate(contours):
+        area = cv2.contourArea(cnt)
+        if area < min_area_px:
+            continue
+        eps = _smooth_epsilon(cv2.arcLength(cnt, True), smoothness)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        d = _to_svg_path(approx, scale_back)
+
+        # holes: draw as separate paths with fill-rule evenodd
+        # We’ll just use one path per contour; fill-rule evenodd on group handles holes.
+        paths.append(d)
+    return paths
+
+# ---------- API ----------
 
 @app.get("/")
-def root():
-    return {"status": "ok", "service": "printready-vectorizer-api"}
+def health():
+    return PlainTextResponse("OK")
 
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
-    max_colors: int = Form(4),
-    primitive_snap: bool = Form(False),
-    min_path_area: float = Form(0.0002),
-    layer_order: str = Form("Dark → Light"),
+    max_colors: int = Form(2),
+    primitive_snap: bool = Form(False),   # accepted but not used in this baseline
+    smoothness: str = Form("Low (faster, sharper)"),
+    min_path_area: float = Form(0.0002),  # fraction of pixels
+    layer_order: str = Form("Dark → Light"),  # or "Light → Dark"
 ):
     data = await file.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        return JSONResponse(status_code=400, content={"error": "bad_image"})
+    rgb = _read_image(data)  # RGB
+    rgb, scale = _resize_max(rgb, 1600)
+    h, w = rgb.shape[:2]
+    total_px = h * w
+    min_area_px = max(1.0, min_path_area * total_px)
 
-    if img.ndim == 3 and img.shape[2] == 4:
-        # remove alpha by compositing against white
-        alpha = img[..., 3:4] / 255.0
-        base = np.full_like(img[..., :3], 255)
-        img = (img[..., :3] * alpha + base * (1 - alpha)).astype(np.uint8)
+    svg_parts = [_svg_header(w / scale, h / scale)]
 
-    rgb = to_rgb(img)
-    svg = vectorize_core(
-        rgb,
-        max_colors=max_colors,
-        primitive_snap=primitive_snap,
-        min_area_frac=float(min_path_area),
-        layer_order=layer_order,
-    )
-    return {"svg": svg}
+    if max_colors <= 2:
+        # --- Binary mode (two colors: black & white) ---
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        mask_white = _binary_mask_from_gray(gray)  # 255=white background, 0=black ink if text is dark
+
+        # Build two layers: background (white) then foreground (black)
+        # Background rectangle:
+        svg_parts.append(f'<rect x="0" y="0" width="{w/scale:.2f}" height="{h/scale:.2f}" fill="#ffffff"/>')
+
+        # Foreground mask is the inverse of white areas:
+        mask_black = (mask_white < 128).astype(np.uint8) * 255
+        paths = _contours_to_paths(mask_black, min_area_px, smoothness, scale)
+        if paths:
+            svg_parts.append('<g fill="#000000" stroke="none" fill-rule="evenodd">')
+            for d in paths:
+                svg_parts.append(f'<path d="{d}"/>')
+            svg_parts.append('</g>')
+    else:
+        # --- Multi-color mode (3–8 colors) ---
+        label_img, palette = _quantize_lab(rgb, int(max_colors), rnd=0)
+        order = _layer_order_indices(palette, layer_order)
+
+        # Draw background layer first: pick the lightest/darkest per order
+        for idx in order:
+            col = palette[idx]
+            mask = (label_img == idx).astype(np.uint8) * 255
+            # filter tiny specks (open-close)
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            paths = _contours_to_paths(mask, min_area_px, smoothness, scale)
+            if not paths:
+                continue
+            fill = _svg_color(col)
+            svg_parts.append(f'<g fill="{fill}" stroke="none" fill-rule="evenodd">')
+            for d in paths:
+                svg_parts.append(f'<path d="{d}"/>')
+            svg_parts.append('</g>')
+
+    svg_parts.append(_svg_footer())
+    svg = "".join(svg_parts)
+
+    return JSONResponse({"svg": svg})
