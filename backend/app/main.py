@@ -71,24 +71,36 @@ def vectorize_bw_otsu(rgb: np.ndarray, min_area_px: int, eps_px: float):
     # 1) grayscale
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    # 2) Otsu (invert) => dark ink = 255 foreground, background = 0
-    _thr, mask = cv2.threshold(
-        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
+    # 2) Decide if background is light or dark using global mean
+    mean_val = float(gray.mean())
+
+    # If the image is overall dark, assume light shapes on dark bg -> normal Otsu
+    # Else assume dark shapes on light bg -> inverted Otsu
+    if mean_val < 128:
+        # light-on-dark (foreground = light)
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        foreground_is_dark = False
+    else:
+        # dark-on-light (foreground = dark)
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        foreground_is_dark = True
 
     # 3) light despeckle
     kernel = np.ones((2, 2), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    # 4) contours on foreground
+    # 4) contours on (chosen) foreground
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-    # 5) build paths; skip near-full-frame to avoid black rectangle
-    full_frame_cutoff = 0.98 * (W * H)
+    # 5) Build paths, skip near-full-frame to avoid giant filled box
+    full_frame_px = W * H
+    full_cut = 0.95 * full_frame_px
+    fill_color = "#000000" if foreground_is_dark else "#FFFFFF"
+
     paths = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < min_area_px or area >= full_frame_cutoff:
+        if area < min_area_px or area >= full_cut:
             continue
 
         approx = cv2.approxPolyDP(c, eps_px, True)
@@ -96,11 +108,15 @@ def vectorize_bw_otsu(rgb: np.ndarray, min_area_px: int, eps_px: float):
             continue
 
         d = "M " + " ".join(f"{p[0][0]},{p[0][1]}" for p in approx) + " Z"
-        paths.append(f'<path d="{d}" fill="#000000"/>')
+        paths.append(f'<path d="{d}" fill="{fill_color}"/>')
+
+    # Always paint a white background first so viewers don't show dark by default
+    svg_bg = f'<rect width="{W}" height="{H}" fill="#FFFFFF"/>'
 
     svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
-        f'preserveAspectRatio="xMidYMid meet">{"".join(paths)}</svg>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMid meet">'
+        f'{svg_bg}{"".join(paths)}</svg>'
     )
     return svg, len(paths)
 
