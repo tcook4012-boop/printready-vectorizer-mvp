@@ -63,60 +63,60 @@ def mean_saturation(rgb: np.ndarray) -> float:
 # ------------------- Black/White Otsu Pipeline -------------------
 # =================================================================
 
-def vectorize_bw_otsu(rgb: np.ndarray, min_area_px: int, eps_px: float):
+def _contours_from_mask(mask, min_area_px, full_cut, eps_px):
     import cv2
-
-    H, W, _ = rgb.shape
-
-    # 1) grayscale
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # 2) Decide if background is light or dark using global mean
-    mean_val = float(gray.mean())
-
-    # If the image is overall dark, assume light shapes on dark bg -> normal Otsu
-    # Else assume dark shapes on light bg -> inverted Otsu
-    if mean_val < 128:
-        # light-on-dark (foreground = light)
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        foreground_is_dark = False
-    else:
-        # dark-on-light (foreground = dark)
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        foreground_is_dark = True
-
-    # 3) light despeckle
-    kernel = np.ones((2, 2), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-    # 4) contours on (chosen) foreground
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-    # 5) Build paths, skip near-full-frame to avoid giant filled box
-    full_frame_px = W * H
-    full_cut = 0.95 * full_frame_px
-    fill_color = "#000000" if foreground_is_dark else "#FFFFFF"
-
     paths = []
+    kept = 0
     for c in cnts:
         area = cv2.contourArea(c)
         if area < min_area_px or area >= full_cut:
             continue
-
         approx = cv2.approxPolyDP(c, eps_px, True)
         if len(approx) < 3:
             continue
-
         d = "M " + " ".join(f"{p[0][0]},{p[0][1]}" for p in approx) + " Z"
-        paths.append(f'<path d="{d}" fill="{fill_color}"/>')
+        paths.append(d)
+        kept += 1
+    return kept, paths
 
-    # Always paint a white background first so viewers don't show dark by default
-    svg_bg = f'<rect width="{W}" height="{H}" fill="#FFFFFF"/>'
+def vectorize_bw_otsu(rgb: np.ndarray, min_area_px: int, eps_px: float):
+    import cv2
 
+    H, W, _ = rgb.shape
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # Both masks: normal Otsu (light foreground) and inverted (dark foreground)
+    _, mask_norm = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, mask_inv  = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Light despeckle on both
+    kernel = np.ones((2, 2), np.uint8)
+    mask_norm = cv2.morphologyEx(mask_norm, cv2.MORPH_OPEN, kernel)
+    mask_inv  = cv2.morphologyEx(mask_inv,  cv2.MORPH_OPEN, kernel)
+
+    full_cut = 0.95 * (W * H)
+
+    kept_norm, paths_norm = _contours_from_mask(mask_norm, min_area_px, full_cut, eps_px)
+    kept_inv,  paths_inv  = _contours_from_mask(mask_inv,  min_area_px, full_cut, eps_px)
+
+    # Score: pick mask with more kept contours; tie-breaker favors dark foreground (inv)
+    choose_inv = False
+    if kept_inv > kept_norm:
+        choose_inv = True
+    elif kept_inv == kept_norm:
+        # prefer dark foreground if equal
+        choose_inv = True
+
+    paths = paths_inv if choose_inv else paths_norm
+    fill_color = "#000000" if choose_inv else "#FFFFFF"
+
+    # Build SVG
+    bg = f'<rect width="{W}" height="{H}" fill="#FFFFFF"/>'
+    svg_paths = "".join(f'<path d="{d}" fill="{fill_color}"/>' for d in paths)
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMid meet">'
-        f'{svg_bg}{"".join(paths)}</svg>'
+        f'viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMid meet">{bg}{svg_paths}</svg>'
     )
     return svg, len(paths)
 
@@ -217,10 +217,16 @@ async def vectorize(
 
     if use_bw:
         svg, npaths = vectorize_bw_otsu(rgb, area_px, eps_px)
-        return JSONResponse({"svg": svg}, headers={"X-Mode": "bw-otsu", "X-Paths": str(npaths)})
+        return JSONResponse({"svg": svg}, headers={
+            "X-Mode": "bw-otsu",
+            "X-Paths": str(npaths)
+        })
 
     # multicolor path
     k = int(np.clip(max_colors, 2, 8))
     labels_img, palette = quantize_kmeans(rgb, k)
     svg, npaths = raster_to_svg_contours(labels_img, palette, area_px, order, eps_px)
-    return JSONResponse({"svg": svg}, headers={"X-Mode": "kmeans", "X-Paths": str(npaths)})
+    return JSONResponse({"svg": svg}, headers={
+        "X-Mode": "kmeans",
+        "X-Paths": str(npaths)
+    })
