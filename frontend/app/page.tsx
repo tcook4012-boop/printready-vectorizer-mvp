@@ -7,7 +7,11 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
-  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">("medium");
+  const [smoothness, setSmoothness] = useState<"low"|"medium"|"high">("medium");
+  const [minPathArea, setMinPathArea] = useState(0.0005);
+  const [order, setOrder] = useState<"light_to_dark"|"dark_to_light">("light_to_dark");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
   const [svg, setSvg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,18 +29,18 @@ export default function Home() {
         maxColors,
         primitiveSnap,
         smoothness,
-        minPathArea: 0.0005,
-      });
+        minPathArea,
+        // @ts-ignore - order only used on backend; safe to include
+        order,
+      } as any);
 
       const cleaned = normalizeSvg(rawSvg);
       setSvg(cleaned);
     } catch (e: any) {
       const msg = String(e?.message || e);
-      setError(
-        msg.includes("Failed to fetch")
-          ? "Could not reach the API. Check NEXT_PUBLIC_API_BASE."
-          : msg
-      );
+      setError(msg.includes("Failed to fetch")
+        ? "Could not reach the API. Check NEXT_PUBLIC_API_BASE."
+        : msg);
     } finally {
       setLoading(false);
     }
@@ -94,9 +98,42 @@ export default function Home() {
         </label>
       </div>
 
-      <button onClick={handleVectorize} disabled={loading}>
-        {loading ? "Processing..." : "Vectorize"}
-      </button>
+      <div style={{ marginTop: 10 }}>
+        <button onClick={() => setShowAdvanced(!showAdvanced)}>
+          {showAdvanced ? "Hide Advanced" : "Show Advanced"}
+        </button>
+      </div>
+
+      {showAdvanced && (
+        <div style={{ border: "1px solid #ddd", padding: 10, marginTop: 8 }}>
+          <div>
+            <label>Min Path Area (fraction of pixels): </label>
+            <input
+              type="number"
+              step={0.0001}
+              min={0}
+              value={minPathArea}
+              onChange={(e) => setMinPathArea(Number(e.target.value))}
+            />
+            <span style={{ marginLeft: 8, color: "#666" }}>
+              (try 0.0002 – 0.001 to remove specks)
+            </span>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <label>Layer Order: </label>
+            <select value={order} onChange={(e) => setOrder(e.target.value as any)}>
+              <option value="light_to_dark">Light → Dark</option>
+              <option value="dark_to_light">Dark → Light</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <button onClick={handleVectorize} disabled={loading}>
+          {loading ? "Processing..." : "Vectorize"}
+        </button>
+      </div>
 
       {error && <p style={{ color: "red" }}>{error}</p>}
 
