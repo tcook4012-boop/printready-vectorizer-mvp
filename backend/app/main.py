@@ -4,13 +4,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from PIL import Image
-import io
-import numpy as np
+import io, numpy as np
 from sklearn.cluster import KMeans
 
 app = FastAPI()
 
-# CORS (open for now; tighten to your Vercel domains later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,7 +25,7 @@ def root():
 def health():
     return PlainTextResponse("ok")
 
-# ---- helpers ----
+# ---------- helpers ----------
 def srgb_to_linear(x):
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
 
@@ -39,11 +37,11 @@ def quantize_kmeans(img_rgb, k):
     lin = srgb_to_linear(arr)
     H, W, _ = lin.shape
     flat = lin.reshape(-1, 3)
-    km = KMeans(n_clusters=k, n_init=4, max_iter=50, random_state=0)
+    km = KMeans(n_clusters=int(k), n_init=4, max_iter=50, random_state=0)
     labels = km.fit_predict(flat)
     centers_lin = km.cluster_centers_
     centers = (linear_to_srgb(centers_lin) * 255.0).clip(0, 255).astype(np.uint8)
-    return labels.reshape(H, W), centers
+    return labels.reshape(H, W), centers  # labels_img, palette
 
 def palette_luminance_srgb(palette):
     rgb = palette.astype(np.float32) / 255.0
@@ -51,44 +49,66 @@ def palette_luminance_srgb(palette):
     R, G, B = lin[:,0], lin[:,1], lin[:,2]
     return 0.2126*R + 0.7152*G + 0.0722*B
 
-def raster_to_svg_contours(labels_img, palette, min_area_px, order="light_to_dark", eps_factor=0.0015):
+def build_svg_from_labels(labels_img, palette, min_area_px, order, eps_factor):
     import cv2
     H, W = labels_img.shape
     lum = palette_luminance_srgb(palette)
-    idx = np.argsort(lum)  # light -> dark
+    # order index
+    order_idx = np.argsort(lum)  # light->dark
     if order == "dark_to_light":
-        idx = idx[::-1]
+        order_idx = order_idx[::-1]
 
-    paths = []
+    # clamp epsilon so we never over-simplify to nothing
     diag = (H**2 + W**2) ** 0.5
-    eps = eps_factor * diag
+    eps = float(eps_factor) * diag
+    eps = max(0.5, min(eps, 0.05 * diag))  # 0.5px .. 5% of diag
 
-    for lab in idx:
-        mask = (labels_img == lab).astype(np.uint8) * 255
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area < min_area_px:
-                continue
-            approx = cv2.approxPolyDP(c, eps, True)
-            d = "M " + " ".join(f"{p[0][0]},{p[0][1]}" for p in approx) + " Z"
-            r, g, b = palette[lab]
-            paths.append(f'<path d="{d}" fill="#{r:02x}{g:02x}{b:02x}" />')
+    def pass_once(retr=cv2.RETR_EXTERNAL, chain=cv2.CHAIN_APPROX_NONE, min_area=int(min_area_px)):
+        paths = []
+        for lab in order_idx:
+            mask = (labels_img == lab).astype(np.uint8) * 255
+            cnts, _ = cv2.findContours(mask, retr, chain)
+            for c in cnts:
+                area = cv2.contourArea(c)
+                if area < min_area:
+                    continue
+                approx = cv2.approxPolyDP(c, eps, True)
+                if len(approx) < 3:
+                    continue
+                d = "M " + " ".join(f"{p[0][0]},{p[0][1]}" for p in approx) + " Z"
+                r, g, b = palette[lab]
+                paths.append(f'<path d="{d}" fill="#{r:02x}{g:02x}{b:02x}"/>')
+        return paths
 
-    return (
+    # First attempt (fast)
+    paths = pass_once()
+    # Fallbacks if nothing drew
+    if len(paths) == 0:
+        # try tree retrieval (captures holes)
+        paths = pass_once(retr=cv2.RETR_TREE)
+    if len(paths) == 0 and min_area_px > 1:
+        # drop area threshold 10x
+        paths = pass_once(min_area=max(1, int(min_area_px // 10)))
+    if len(paths) == 0 and eps > 0.5:
+        # reduce simplification
+        eps_factor *= 0.5
+        paths = pass_once()
+
+    svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
         f'preserveAspectRatio="xMidYMid meet">{"".join(paths)}</svg>'
     )
+    return svg, len(paths)
 
-# ---- route ----
+# ---------- route ----------
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
     max_colors: int = Form(4),
     primitive_snap: bool = Form(False),
-    smoothness: str = Form("medium"),      # "low" | "medium" | "high"
-    min_path_area: float = Form(0.0005),   # fraction of W*H
-    order: str = Form("light_to_dark")     # or "dark_to_light"
+    smoothness: str = Form("medium"),        # "low"|"medium"|"high"
+    min_path_area: float = Form(0.0005),     # fraction of W*H
+    order: str = Form("dark_to_light")       # default dark->light to be visible
 ):
     data = await file.read()
     img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -102,6 +122,10 @@ async def vectorize(
     if smoothness == "low":   eps_factor = 0.0005
     if smoothness == "high":  eps_factor = 0.0025
 
-    area_px = max(1, int(min_path_area * (W * H)))
-    svg = raster_to_svg_contours(labels_img, palette, area_px, order, eps_factor)
-    return JSONResponse({"svg": svg})
+    area_px = max(1, int(float(min_path_area) * (W * H)))
+
+    svg, npaths = build_svg_from_labels(labels_img, palette, area_px, order, eps_factor)
+
+    # attach a tiny debug header (shows up in Network tab)
+    headers = {"X-Vectorize-Debug": f"paths={npaths}; area_px={area_px}; epsFactor={eps_factor}"}
+    return JSONResponse({"svg": svg}, headers=headers)
