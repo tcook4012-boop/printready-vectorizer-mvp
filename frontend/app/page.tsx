@@ -1,13 +1,14 @@
 "use client";
 import React, { useState } from "react";
-import { vectorizeImage } from "@/lib/api";
-import { normalizeSvg } from "@/lib/svg";
+// ⬇️ use RELATIVE paths instead of "@/..."
+import { vectorizeImage } from "../lib/api";
+import { normalizeSvg } from "../lib/svg";
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
-  const [smoothness, setSmoothness] = useState<"low"|"medium"|"high">("medium");
+  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">("medium");
   const [svg, setSvg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,23 +56,26 @@ export default function Home() {
       <input
         type="file"
         accept="image/*"
-        onChange={e => setFile(e.target.files?.[0] || null)}
+        onChange={(e) => setFile(e.target.files?.[0] || null)}
       />
 
       <div style={{ margin: "10px 0" }}>
-        <label>Max Colors (2-8): </label>
+        <label>Max Colors (2–8): </label>
         <input
           type="number"
           min={2}
           max={8}
           value={maxColors}
-          onChange={e => setMaxColors(Number(e.target.value))}
+          onChange={(e) => setMaxColors(Number(e.target.value))}
         />
       </div>
 
       <div>
         <label>Smoothness: </label>
-        <select value={smoothness} onChange={e => setSmoothness(e.target.value as any)}>
+        <select
+          value={smoothness}
+          onChange={(e) => setSmoothness(e.target.value as any)}
+        >
           <option value="low">Low (faster, sharper)</option>
           <option value="medium">Medium</option>
           <option value="high">High (smoother curves)</option>
@@ -83,7 +87,7 @@ export default function Home() {
           <input
             type="checkbox"
             checked={primitiveSnap}
-            onChange={e => setPrimitiveSnap(e.target.checked)}
+            onChange={(e) => setPrimitiveSnap(e.target.checked)}
           />
           Primitive Snap
         </label>
@@ -98,8 +102,10 @@ export default function Home() {
       {svg && (
         <>
           <h3>Output:</h3>
-          <div style={{ border: "1px solid #999", width: "500px", height: "500px" }}
-               dangerouslySetInnerHTML={{ __html: svg }} />
+          <div
+            style={{ border: "1px solid #999", width: "500px", height: "500px" }}
+            dangerouslySetInnerHTML={{ __html: svg }}
+          />
           <button onClick={downloadSvg}>Download SVG</button>
         </>
       )}
