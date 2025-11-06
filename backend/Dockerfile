@@ -1,26 +1,38 @@
-# backend/Dockerfile
-FROM python:3.11-slim
+# --- Stage 1: Build tools (to install vtracer) -------------------------------
+FROM python:3.11-slim AS base
 
-# Minimal system deps used by opencv-headless wheels
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libgl1 \
-    libglib2.0-0 \
+    build-essential curl ca-certificates git \
+    pkg-config libssl-dev \
+    rustc cargo \
+    inkscape potrace \
  && rm -rf /var/lib/apt/lists/*
 
-# We'll keep our code under /srv
-WORKDIR /srv
+# Install vtracer via cargo (deterministic, no GUI needed)
+# If you want to pin a version, add:  cargo install vtracer --version 0.6.0
+RUN cargo install vtracer
 
-# Install Python deps
-COPY requirements.txt /srv/requirements.txt
-RUN pip install --no-cache-dir -r /srv/requirements.txt
+# --- Stage 2: App ------------------------------------------------------------
+FROM python:3.11-slim
 
-# Copy the backend app package
-COPY app/ /srv/app/
+# Runtime tools needed by our app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    inkscape potrace \
+ && rm -rf /var/lib/apt/lists/*
 
-# (optional but nice) ensure Python can import from /srv
-ENV PYTHONPATH=/srv
+# Copy vtracer binary from the build stage
+COPY --from=base /root/.cargo/bin/vtracer /usr/local/bin/vtracer
+
+# App files
+WORKDIR /srv/app
+COPY backend/requirements.txt /srv/app/requirements.txt
+RUN pip install --no-cache-dir -r /srv/app/requirements.txt
+
+# Copy app code
+COPY backend/app /srv/app
+
+# Render/uvicorn
 ENV PORT=8000
-
-# 🔑 main.py is inside the app package → module path is app.main:app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
