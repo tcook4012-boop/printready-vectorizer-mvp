@@ -1,9 +1,9 @@
 // frontend/lib/api.ts
 export type VectorizeOptions = {
-  maxColors: number;          // 2..8 recommended
-  primitiveSnap: boolean;     // edge snapping hint
+  maxColors: number;
+  primitiveSnap: boolean;
   smoothness?: "low" | "medium" | "high";
-  minPathArea?: number;       // fraction of total pixels, e.g. 0.0005
+  minPathArea?: number;
 };
 
 export async function vectorizeImage(
@@ -20,6 +20,7 @@ export async function vectorizeImage(
   fd.append("file", file, file.name);
   fd.append("max_colors", String(opts.maxColors));
   fd.append("primitive_snap", String(!!opts.primitiveSnap));
+
   if (opts.smoothness) fd.append("smoothness", opts.smoothness);
   if (typeof opts.minPathArea === "number") fd.append("min_path_area", String(opts.minPathArea));
 
@@ -36,7 +37,8 @@ export async function vectorizeImage(
 
   const data = await res.json();
   if (!data || typeof data.svg !== "string") {
-    throw new Error("Vectorize: invalid response (missing {svg})");
+    throw new Error("Invalid response from API (missing svg)");
   }
+
   return data.svg;
 }
