@@ -1,4 +1,4 @@
-# ---- Stage 1: build tools (install vtracer) -------------------------------
+# ---------- base stage: build vtracer ----------
 FROM python:3.11-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -6,33 +6,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
     rustc cargo \
     inkscape potrace \
- && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Install vtracer
+# Build/install vtracer (Rust CLI)
 RUN cargo install vtracer
 
-# ---- Stage 2: runtime ------------------------------------------------------
-FROM python:3.11-slim
+# ---------- runtime stage ----------
+FROM python:3.11-slim AS runtime
 
-# Runtime deps for engines
+# OS deps for potrace/inkscape runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     inkscape potrace \
- && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Copy vtracer binary from build stage
-COPY --from=base /root/.cargo/bin/vtracer /usr/local/bin/vtracer
-
-# Working dir for app
 WORKDIR /srv/app
 
-# IMPORTANT: paths are relative to the build context (Root Directory = backend)
+# IMPORTANT: paths are now relative to /backend (Root Directory)
 COPY requirements.txt /srv/app/requirements.txt
 RUN pip install --no-cache-dir -r /srv/app/requirements.txt
 
-# Copy FastAPI app code
+# Copy vtracer binary from base
+COPY --from=base /root/.cargo/bin/vtracer /usr/local/bin/vtracer
+
+# Copy app code
 COPY app /srv/app
 
+# For Render
 ENV PORT=8000
 EXPOSE 8000
 
+# If you're using FastAPI:
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
