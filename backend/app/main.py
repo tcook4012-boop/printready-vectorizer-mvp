@@ -13,41 +13,32 @@ import subprocess
 
 app = FastAPI()
 
-# CORS: allow your web app to hit the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],  # tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- helpers ----------
+# ------------ helpers ------------
 
 SVG_START_RE = re.compile(r"<svg[\s>]", re.IGNORECASE)
 SVG_END_RE = re.compile(r"</svg\s*>", re.IGNORECASE)
 
 def extract_svg(raw: str) -> str:
-    """
-    Accepts content that may include XML prolog / DOCTYPE / comments before <svg>.
-    Returns the first <svg>…</svg> block (or <svg>…EOF if no end tag present).
-    Raises ValueError if no <svg> tag found.
-    """
     if not raw:
         raise ValueError("Empty output")
     m_start = SVG_START_RE.search(raw)
     if not m_start:
         raise ValueError("output is not an <svg> root")
     start = m_start.start()
-
     m_end = SVG_END_RE.search(raw, start)
     if m_end:
-        end = m_end.end()
-        return raw[start:end].strip()
-    # If no closing tag, return from <svg> to end (some generators stream)
+        return raw[start:m_end.end()].strip()
     return raw[start:].strip()
 
-def run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+def run(cmd: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -61,35 +52,32 @@ def build_vtracer_cmd(
     in_path: str,
     out_path: str,
     *,
-    mode: str,
-    max_colors: int,
-    corner_threshold: float,
-    filter_speckle: int,
-    thin_lines: bool,
+    mode: str,               # "spline" | "polygon"
+    color_precision: int,    # maps from maxColors
+    corner_threshold: float, # e.g. 30
+    filter_speckle: int,     # e.g. 4
 ) -> list[str]:
     """
-    vtracer 0.6.5 flags (tested):
-      --mode <polygon|spline>
-      -p, --palette-size <INT>        (colors)
-      -c, --corner-threshold <FLOAT>  (e.g. 30)
-      -f, --filter-speckle <INT>      (pixels)
-      --thin-lines <true|false>
+    Match the flags your vtracer binary actually supports (per the error output):
 
-    We keep things minimal to reduce surface for parser errors.
+      --color_precision <int>
+      --corner_threshold <float>
+      --filter_speckle <int>
+      --input <path>
+      --mode <spline|polygon>
+      --output <path>
     """
-    cmd = [
+    return [
         "vtracer",
         "--input", in_path,
         "--output", out_path,
         "--mode", mode,
-        "-p", str(max_colors),
-        "-c", str(corner_threshold),
-        "-f", str(filter_speckle),
-        "--thin-lines", "true" if thin_lines else "false",
+        "--color_precision", str(int(color_precision)),
+        "--corner_threshold", str(float(corner_threshold)),
+        "--filter_speckle", str(int(filter_speckle)),
     ]
-    return cmd
 
-# ---------- routes ----------
+# ------------ routes ------------
 
 @app.get("/health")
 def health():
@@ -99,66 +87,49 @@ def health():
 async def vectorize(
     file: UploadFile = File(...),
     maxColors: int = Form(...),
-    smoothing: Optional[str] = Form("smooth"),     # "smooth" | "sharp"
+    smoothing: Optional[str] = Form("smooth"),     # "smooth" -> spline, "sharp" -> polygon
     cornerThreshold: Optional[float] = Form(30.0),
     filterSpeckle: Optional[int] = Form(4),
-    thinLines: Optional[bool] = Form(False),
+    thinLines: Optional[bool] = Form(False),       # accepted from UI but unused (not supported by your vtracer)
 ):
-    """
-    Accepts form-data:
-      - file: image
-      - maxColors: int
-      - smoothing: "smooth"|"sharp" -> maps to vtracer mode
-      - cornerThreshold: float
-      - filterSpeckle: int
-      - thinLines: bool
-    Returns: {"svg": "<svg>...</svg>"} or 500 with stderr/cmd/snippet.
-    """
     tmpdir = tempfile.mkdtemp(prefix="vtracer_")
     in_path = os.path.join(tmpdir, "input")
     out_path = os.path.join(tmpdir, "out.svg")
 
     try:
-        # Save upload
-        # Preserve extension for some decoders; fallback to .png
+        # save upload (keep extension for decoder)
         ext = os.path.splitext(file.filename or "")[1].lower()
         if ext not in [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]:
             ext = ".png"
         in_path = in_path + ext
-
         with open(in_path, "wb") as f:
             f.write(await file.read())
 
-        # Map smoothing -> mode
         mode = "spline" if (smoothing or "smooth").lower() == "smooth" else "polygon"
-
-        # Defaults / guards
-        max_colors = int(max(1, min(64, int(maxColors))))
+        color_precision = max(1, min(64, int(maxColors)))
         corner = float(cornerThreshold if cornerThreshold is not None else 30.0)
         speckle = int(filterSpeckle if filterSpeckle is not None else 4)
-        thin = bool(thinLines)
 
         cmd = build_vtracer_cmd(
             in_path,
             out_path,
             mode=mode,
-            max_colors=max_colors,
+            color_precision=color_precision,
             corner_threshold=corner,
             filter_speckle=speckle,
-            thin_lines=thin,
         )
 
         proc = run(cmd, timeout=180)
 
-        # If vtracer failed (non-zero), surface detailed error + tiny snippet if any
         if proc.returncode != 0 or not os.path.exists(out_path):
+            # try to read any partial output for debugging
             snippet = ""
             if os.path.exists(out_path):
                 try:
                     with open(out_path, "r", encoding="utf-8", errors="ignore") as fh:
                         snippet = fh.read(300)
                 except Exception:
-                    snippet = ""
+                    pass
             return JSONResponse(
                 status_code=500,
                 content={
@@ -166,11 +137,10 @@ async def vectorize(
                     "stdout": proc.stdout,
                     "stderr": proc.stderr,
                     "cmd": cmd,
-                    "snippet": snippet[:400],
+                    "snippet": snippet,
                 },
             )
 
-        # Read output and normalize to pure <svg>…</svg>
         with open(out_path, "r", encoding="utf-8", errors="ignore") as fh:
             raw = fh.read()
 
@@ -178,7 +148,6 @@ async def vectorize(
         return {"svg": svg}
 
     except Exception as e:
-        # Unexpected error path
         return JSONResponse(
             status_code=500,
             content={
@@ -188,7 +157,4 @@ async def vectorize(
             },
         )
     finally:
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
