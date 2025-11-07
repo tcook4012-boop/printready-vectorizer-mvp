@@ -1,8 +1,6 @@
-fastapi
-uvicorn[standard]
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
 pillow
 numpy
-opencv-python-headless
 scikit-image
-python-multipart
-pydantic
+opencv-python-headless
