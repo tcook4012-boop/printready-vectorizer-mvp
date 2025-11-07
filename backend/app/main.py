@@ -12,13 +12,26 @@ from starlette.background import BackgroundTask
 app = FastAPI(title="PrintReady Vectorizer API")
 
 # -----------------------------
-# Utilities
+# Helpers
 # -----------------------------
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 def _exists_and_nonempty(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
+
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+def _have_potrace_stack() -> bool:
+    # Potrace path relies on potrace; mkbitmap and convert are very helpful, but only potrace is strictly required.
+    return _which("potrace") is not None
+
+def _have_mkbitmap() -> bool:
+    return _which("mkbitmap") is not None
+
+def _have_convert() -> bool:
+    return _which("convert") is not None
 
 def save_upload_to_temp(upload: UploadFile, suffix: str = ".jpg") -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -37,7 +50,7 @@ def _clean_temp(paths: List[str]):
             pass
 
 # -----------------------------
-# VTracer (multi-color) driver
+# VTracer driver
 # -----------------------------
 def vtracer_cmd(inp: str, outp: str, *, mode: str = "polygon",
                 max_colors: int = 4, corner_threshold: float = 30.0,
@@ -53,47 +66,34 @@ def vtracer_cmd(inp: str, outp: str, *, mode: str = "polygon",
     ]
 
 # -----------------------------
-# Potrace (mono/duo-color) driver
-# Notes:
-# - Potrace is fundamentally monochrome. For 2-color logos, we threshold twice
-#   from adaptive levels and merge; here we start with single-threshold for stability.
+# Potrace driver (with optional mkbitmap/convert)
 # -----------------------------
 def potrace_svg(inp: str, outp: str, *, threshold: Optional[int] = None) -> subprocess.CompletedProcess:
-    # If a threshold is provided, use ImageMagick to binarize first
     work_inp = inp
     temp_binarized = None
+    temp_pgm = None
     try:
-        if threshold is not None:
+        # optional binarization via ImageMagick
+        if threshold is not None and _have_convert():
             temp_binarized = tempfile.mktemp(suffix=".png")
-            # Convert to grayscale + threshold
-            # Using ImageMagick: -colorspace Gray -threshold X%
-            cmd_magick = ["convert", inp, "-colorspace", "Gray", "-threshold", f"{threshold}%", temp_binarized]
-            proc_m = _run(cmd_magick)
-            if proc_m.returncode != 0 or not _exists_and_nonempty(temp_binarized):
-                return proc_m
-            work_inp = temp_binarized
+            proc_m = _run(["convert", inp, "-colorspace", "Gray", "-threshold", f"{threshold}%", temp_binarized])
+            if proc_m.returncode == 0 and _exists_and_nonempty(temp_binarized):
+                work_inp = temp_binarized
 
-        # Use mkbitmap (if available) for smoothing before potrace
-        temp_pgm = tempfile.mktemp(suffix=".pgm")
-        proc_bm = _run(["mkbitmap", "-f", "4", "-s", "2", "-o", temp_pgm, work_inp])
-        if proc_bm.returncode != 0 or not _exists_and_nonempty(temp_pgm):
-            # Fallback: let potrace read source directly
-            proc = _run(["potrace", "-s", "-o", outp, work_inp])
-        else:
-            proc = _run(["potrace", "-s", "-o", outp, temp_pgm])
+        # optional smoothing via mkbitmap
+        if _have_mkbitmap():
+            temp_pgm = tempfile.mktemp(suffix=".pgm")
+            proc_bm = _run(["mkbitmap", "-f", "4", "-s", "2", "-o", temp_pgm, work_inp])
+            if proc_bm.returncode == 0 and _exists_and_nonempty(temp_pgm):
+                return _run(["potrace", "-s", "-o", outp, temp_pgm])
 
-        # Clean temp pgm
-        try:
-            if os.path.exists(temp_pgm):
-                os.remove(temp_pgm)
-        except:
-            pass
-
-        return proc
+        # fallback: potrace directly
+        return _run(["potrace", "-s", "-o", outp, work_inp])
     finally:
-        if temp_binarized:
+        for p in (temp_binarized, temp_pgm):
             try:
-                os.remove(temp_binarized)
+                if p and os.path.exists(p):
+                    os.remove(p)
             except:
                 pass
 
@@ -104,25 +104,26 @@ def choose_engine(engine: str, max_colors: int, smoothing: str) -> str:
     e = (engine or "auto").lower()
     if e in ("vtracer", "potrace"):
         return e
-    # Auto: prefer Potrace for mono/duo-color logos and precise edges
-    if max_colors <= 2 or smoothing == "precision":
+    # auto:
+    # prefer potrace for <=2 colors or "precision", BUT only if potrace is available
+    if (max_colors <= 2 or smoothing == "precision") and _have_potrace_stack():
         return "potrace"
     return "vtracer"
 
 # -----------------------------
-# API: Single vectorize
+# API: single vectorize
 # -----------------------------
 @app.post("/vectorize", response_class=PlainTextResponse)
 async def vectorize(
     file: UploadFile = File(...),
     max_colors: int = Form(4),
-    smoothing: str = Form("precision"),  # "precision" or "smooth"
-    primitive_snap: bool = Form(False),  # (reserved)
-    min_path_area: str = Form(None),     # (reserved)
+    smoothing: str = Form("precision"),  # "precision" | "smooth"
+    primitive_snap: bool = Form(False),
+    min_path_area: str = Form(None),
     corner_threshold: str = Form("30"),
     filter_speckle: str = Form("4"),
     engine: str = Form("auto"),          # "auto" | "vtracer" | "potrace"
-    threshold: str = Form(None),         # Potrace binarization threshold percent (e.g., "60")
+    threshold: str = Form(None),         # Potrace threshold (%)
 ):
     ext = ".png" if (file.content_type or "").lower().endswith("png") else ".jpg"
     in_path = save_upload_to_temp(file, suffix=ext)
@@ -143,27 +144,26 @@ async def vectorize(
             proc = _run(cmd)
         else:
             thr = int(threshold) if threshold is not None and str(threshold).isdigit() else None
-            cmd = ["potrace", "(see code: via mkbitmap/convert pipeline)"]
+            cmd = ["potrace", "(auto)"]
             proc = potrace_svg(in_path, out_path, threshold=thr)
 
         if proc.returncode != 0:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "vectorization failed", "stdout": proc.stdout, "stderr": proc.stderr, "cmd": cmd},
-            )
+            return JSONResponse(status_code=500, content={
+                "error": "vectorization failed",
+                "stdout": proc.stdout, "stderr": proc.stderr, "cmd": cmd
+            })
 
         if not _exists_and_nonempty(out_path):
             return JSONResponse(status_code=500, content={"error": "empty svg", "cmd": cmd})
 
         with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
             svg = f.read()
-
         return PlainTextResponse(svg, media_type="image/svg+xml")
     finally:
         _clean_temp([in_path, out_path])
 
 # -----------------------------
-# API: Batch vectorize → ZIP
+# API: batch → ZIP
 # -----------------------------
 @app.post("/batch")
 async def batch_vectorize(
@@ -177,7 +177,7 @@ async def batch_vectorize(
 ):
     tmp_dir = tempfile.mkdtemp(prefix="vec_batch_")
     zip_path = os.path.join(tmp_dir, "result.zip")
-    cleanup_paths = [tmp_dir, zip_path]
+    cleanup_paths = [zip_path, tmp_dir]
 
     try:
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -204,10 +204,12 @@ async def batch_vectorize(
                     proc = potrace_svg(in_path, out_path, threshold=thr)
 
                 if proc.returncode != 0 or not _exists_and_nonempty(out_path):
-                    # Write an error marker file instead of failing the whole batch
                     err_txt = os.path.join(tmp_dir, f"{name_base}__ERROR.txt")
                     with open(err_txt, "w", encoding="utf-8") as ef:
-                        ef.write(f"Vectorization failed for {upload.filename}\n\nstdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n")
+                        ef.write(
+                            f"Vectorization failed for {upload.filename}\n\n"
+                            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n"
+                        )
                     zf.write(err_txt, arcname=os.path.basename(err_txt))
                 else:
                     zf.write(out_path, arcname=os.path.basename(out_path))
