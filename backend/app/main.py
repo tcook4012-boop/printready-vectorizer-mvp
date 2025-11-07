@@ -13,9 +13,11 @@ from PIL import Image
 
 app = FastAPI(title="PrintReady Vectorizer (vtracer)")
 
-# --- CORS (allow your Vercel frontend) ---
-# Adjust/extend this list if you have other frontends.
-ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://printready-vectorizer-mvp.vercel.app").split(",")
+# Allow your Vercel frontend (comma-separate to add more)
+ALLOWED_ORIGINS = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "https://printready-vectorizer-mvp.vercel.app",
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,24 +35,24 @@ def root():
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
-    # UI fields we currently map / partially ignore:
-    max_colors: Optional[int] = Form(None),            # kept for compatibility, not sent to vtracer
-    primitive_snap: Optional[bool] = Form(False),      # not supported in vtracer; ignored
-    min_path_area_fraction: Optional[float] = Form(None),  # 0.0002 – 0.001 suggested from UI
-    layer_order: Optional[str] = Form("light_to_dark"),    # UI only; ignored by vtracer
-    smoothness: Optional[str] = Form("low"),               # UI only; ignored by vtracer
-    # Optional: expose vtracer-native knob
-    color_precision: Optional[float] = Form(None),     # if provided, passed to --color_precision
-    mode: Optional[str] = Form("color"),               # vtracer modes: color | polygon | line
-):
-    """
-    Accept an image upload, run `vtracer`, and return the SVG as text in JSON.
-    """
-    # Validate mode
-    if mode not in {"color", "polygon", "line"}:
-        raise HTTPException(status_code=400, detail=f"Unsupported mode '{mode}'")
 
-    # Read binary content up front
+    # UI compatibility fields (some are ignored by vtracer)
+    max_colors: Optional[int] = Form(None),                 # ignored by vtracer (we may map later)
+    primitive_snap: Optional[bool] = Form(False),           # ignored
+    min_path_area_fraction: Optional[float] = Form(None),   # 0.0002–0.001 suggested
+    layer_order: Optional[str] = Form("light_to_dark"),     # ignored
+    smoothness: Optional[str] = Form("low"),                # ignored
+
+    # vtracer-native knobs
+    color_precision: Optional[float] = Form(None),          # passed to --color_precision (optional)
+    mode: Optional[str] = Form("spline"),                   # vtracer: spline | polygon
+):
+    # Normalize/validate mode (map any legacy 'color' to 'spline')
+    normalized_mode = (mode or "spline").strip().lower()
+    if normalized_mode not in {"spline", "polygon"}:
+        normalized_mode = "spline"
+
+    # Load upload
     try:
         content = await file.read()
         if not content:
@@ -62,40 +64,36 @@ async def vectorize(
     in_path = os.path.join(tmp_dir, "input")
     out_path = os.path.join(tmp_dir, "out.svg")
 
-    # Deduce an extension for PIL friendliness (defaults to .png)
+    # Choose an extension PIL understands
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
         ext = ".png"
     in_path = in_path + ext
 
     try:
-        # Save upload to disk
         with open(in_path, "wb") as f:
             f.write(content)
 
-        # Get image dimensions for speckle filtering conversion
+        # Get image size for speckle-pixel conversion
         try:
             with Image.open(io.BytesIO(content)) as im:
                 width, height = im.size
         except Exception:
-            # Fallback: open from disk if in-memory fails
             with Image.open(in_path) as im:
                 width, height = im.size
 
         # Build vtracer command
-        cmd = ["vtracer", "--mode", mode, "--input", in_path, "--output", out_path]
+        cmd = ["vtracer", "--mode", normalized_mode, "--input", in_path, "--output", out_path]
 
-        # Optional: --color_precision (float). Lower values = fewer/stronger color merges.
+        # Optional: color_precision
         if color_precision is not None:
             try:
-                # vtracer expects a float-ish number; we pass it through
                 cp = float(color_precision)
                 cmd += ["--color_precision", str(cp)]
             except Exception:
-                # ignore bad value; keep defaults
-                pass
+                pass  # ignore bad values
 
-        # Convert our "min_path_area_fraction (0–1)" -> pixel threshold for vtracer's speckle filter
+        # Speckle filtering: fraction → pixel count
         if min_path_area_fraction is not None:
             try:
                 frac = float(min_path_area_fraction)
@@ -103,40 +101,33 @@ async def vectorize(
                     px_thresh = max(1, int(frac * width * height))
                     cmd += ["--filter_speckle", str(px_thresh)]
             except Exception:
-                # ignore bad value
                 pass
 
-        # Run vtracer
+        # Run
         proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=90,  # seconds
+            cmd, capture_output=True, text=True, timeout=90
         )
 
         if proc.returncode != 0 or not os.path.exists(out_path):
-            stderr = (proc.stderr or "").strip()
-            stdout = (proc.stdout or "").strip()
-            detail = {
-                "error": "vectorization failed",
-                "stderr": stderr,
-                "stdout": stdout,
-                "cmd": cmd,
-            }
-            raise HTTPException(status_code=500, detail=detail)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "vectorization failed",
+                    "stderr": (proc.stderr or "").strip(),
+                    "stdout": (proc.stdout or "").strip(),
+                    "cmd": cmd,
+                },
+            )
 
-        # Read SVG text
         with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
             svg_text = f.read()
 
-        # Simple safety: ensure it's SVG
         if "<svg" not in svg_text.lower():
             raise HTTPException(status_code=500, detail="Output did not look like SVG")
 
         return {"svg": svg_text}
 
     finally:
-        # Clean temp files
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
