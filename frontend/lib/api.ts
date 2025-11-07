@@ -1,7 +1,7 @@
 // frontend/lib/api.ts
 export type VectorizeOptions = {
-  maxColors: number;            // 2–8
-  smoothing: string;            // "precision" | "smooth" | etc.
+  maxColors: number;
+  smoothing: string;                 // "precision" | "smooth" | etc.
   primitiveSnap?: boolean;
   minPathArea?: string;
   cornerThreshold?: string;
@@ -9,8 +9,8 @@ export type VectorizeOptions = {
 };
 
 function looksLikeSvg(s: string) {
-  // allow optional XML header then <svg ...>
-  return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(s);
+  // allow optional XML header and any number of comments before <svg>
+  return /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg\b/i.test(s);
 }
 
 export async function vectorizeImage(
@@ -35,38 +35,33 @@ export async function vectorizeImage(
     method: "POST",
     body: fd,
     headers: {
-      // Hint servers to return either JSON or SVG; we'll accept both.
-      "Accept": "application/json, image/svg+xml, text/plain;q=0.9, */*;q=0.8",
+      Accept: "application/json, image/svg+xml, text/plain;q=0.9, */*;q=0.8",
     },
   });
 
   const ctype = res.headers.get("content-type") || "";
+  const bodyText = await res.text(); // read once; we’ll interpret below
 
-  // If the server sent raw SVG text
-  if (ctype.includes("image/svg+xml") || ctype.startsWith("text/plain")) {
-    const text = await res.text();
+  // If server returned raw SVG (svg+xml or plain text), accept it
+  if (ctype.includes("image/svg+xml") || ctype.startsWith("text/plain") || looksLikeSvg(bodyText)) {
     if (!res.ok) {
-      throw new Error(`Vectorize failed (${res.status}): ${text.slice(0, 180)}`);
+      throw new Error(`Vectorize failed (${res.status}): ${bodyText.slice(0, 180)}`);
     }
-    if (!looksLikeSvg(text)) {
-      throw new Error(`Bad response from API (not SVG): ${text.slice(0, 180)}`);
+    if (!looksLikeSvg(bodyText)) {
+      throw new Error(`Bad response from API (not SVG): ${bodyText.slice(0, 180)}`);
     }
-    return text;
+    return bodyText;
   }
 
-  // Otherwise try JSON
+  // Otherwise expect JSON
   let json: any;
   try {
-    json = await res.json();
-  } catch (e) {
-    const fallback = await res.text().catch(() => "");
-    throw new Error(
-      `Bad response from API (not JSON): ${fallback.slice(0, 180)}`
-    );
+    json = JSON.parse(bodyText);
+  } catch {
+    throw new Error(`Bad response from API (not SVG/JSON): ${bodyText.slice(0, 180)}`);
   }
 
   if (!res.ok) {
-    // Bubble up server error details if present
     const detail = json?.detail ?? json?.error ?? json;
     throw new Error(
       `Vectorize failed (${res.status}): ${typeof detail === "string" ? detail : JSON.stringify(detail)}`
@@ -74,8 +69,6 @@ export async function vectorizeImage(
   }
 
   const svg = json?.svg ?? json?.data ?? json?.body;
-  if (!svg || !looksLikeSvg(svg)) {
-    throw new Error("Empty or invalid SVG payload from API.");
-  }
+  if (!svg || !looksLikeSvg(svg)) throw new Error("Empty SVG payload.");
   return svg;
 }
