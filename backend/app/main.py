@@ -1,104 +1,180 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from tempfile import NamedTemporaryFile
-import subprocess
-import shutil
+# backend/app/main.py
+import io
 import os
+import shutil
+import subprocess
+import tempfile
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from PIL import Image
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 def build_vtracer_cmd(
-    in_path: str,
-    out_path: str,
+    input_path: str,
+    output_path: str,
     *,
-    mode: str,
-    color_precision: int,
-    corner_threshold: int,
-    filter_speckle: int
+    mode: str,                 # "spline" or "polygon"
+    color_precision: int,      # integer (vtracer expects int)
+    corner_threshold: int,     # integer (vtracer expects int)
+    filter_speckle: int,       # integer (vtracer expects int)
+    segment_length: float = 3.0,
+    splice_threshold: float = 5.0,
+    hierarchical: str = "stacked",
 ) -> list[str]:
+    """
+    vtracer 0.6.5 flags (accepted):
+      --input <path> --output <path> --mode <spline|polygon>
+      --color_precision <int>
+      --corner_threshold <int>
+      --filter_speckle <int>
+      --segment_length <float>
+      --splice_threshold <float>
+      --hierarchical <none|stacked>
+    """
     return [
         "vtracer",
-        "--input", in_path,
-        "--output", out_path,
+        "--input", input_path,
+        "--output", output_path,
         "--mode", mode,
-        "--color_precision", str(color_precision),
-        "--corner_threshold", str(corner_threshold),
-        "--filter_speckle", str(filter_speckle),
+        "--color_precision", str(int(color_precision)),
+        "--corner_threshold", str(int(corner_threshold)),
+        "--filter_speckle", str(int(filter_speckle)),
+        "--segment_length", str(float(segment_length)),
+        "--splice_threshold", str(float(splice_threshold)),
+        "--hierarchical", hierarchical,
     ]
+
+
+def normalize_image_to_png(tmp_dir: str, upload: UploadFile) -> str:
+    """
+    Ensure we feed vtracer a solid PNG/JPG. Convert anything else to PNG.
+    """
+    raw = upload.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file upload")
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = img.convert("RGBA")
+    except Exception:
+        # If PIL can't open it, just write the raw bytes to jpg and let vtracer fail loudly.
+        tmp_fallback = os.path.join(tmp_dir, "input.jpg")
+        with open(tmp_fallback, "wb") as f:
+            f.write(raw)
+        return tmp_fallback
+
+    out_path = os.path.join(tmp_dir, "input.png")
+    img.save(out_path, format="PNG")
+    return out_path
+
+
+def read_svg_or_raise(svg_path: str) -> str:
+    if not os.path.exists(svg_path):
+        raise HTTPException(status_code=500, detail={"error": "no svg produced"})
+    try:
+        # Do NOT strip — keep content as-is. Just basic sanity checks.
+        with open(svg_path, "r", encoding="utf-8", errors="replace") as f:
+            svg = f.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": f"failed to read svg: {e}"})
+
+    # Basic validation: must contain a root <svg ...>
+    if not svg or ("<svg" not in svg.lower()):
+        snippet = svg[:200] if svg else ""
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "output is not an <svg> root", "snippet": snippet},
+        )
+    return svg
+
 
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
-    maxColors: int = Form(4),
-    smoothing: str = Form("smooth"),
-    cornerThreshold: str = Form("30"),
-    filterSpeckle: int = Form(4),
-):
-    # save input
-    with NamedTemporaryFile(delete=False, suffix=".png") as tmp_in:
-        shutil.copyfileobj(file.file, tmp_in)
-        in_path = tmp_in.name
+    # UI params (strings/booleans come from form-data):
+    maxColors: int = Form(4),                     # maps to color_precision
+    smoothing: Optional[str] = Form("smooth"),    # "smooth"|"sharp" => spline|polygon
+    primitiveSnap: Optional[bool] = Form(False),  # unused by vtracer; kept for API compat
+    cornerThreshold: Optional[str] = Form("30"),  # MUST be integer for vtracer
+    filterSpeckle: Optional[str] = Form("4"),     # MUST be integer
+) -> JSONResponse:
+    """
+    Accepts an image, runs vtracer 0.6.5 with stable flags, returns raw SVG text.
+    """
+    # Map UI smoothing -> vtracer mode
+    mode = "spline" if (smoothing or "").lower().strip() == "smooth" else "polygon"
 
-    out_path = in_path.replace(".png", ".svg")
-
-    # force valid integers only — vtracer rejects decimals
+    # Coerce numeric strings into correct types vtracer expects
     try:
         color_precision = int(maxColors)
-    except:
+    except Exception:
         color_precision = 4
 
     try:
-        corner_threshold = int(float(cornerThreshold))
-    except:
+        corner_threshold = int(float(cornerThreshold or "30"))
+    except Exception:
         corner_threshold = 30
 
     try:
-        filter_speckle = int(filterSpeckle)
-    except:
+        filter_speckle = int(float(filterSpeckle or "4"))
+    except Exception:
         filter_speckle = 4
 
-    mode = "spline" if smoothing == "smooth" else "polygon"
+    # Temporary working dir
+    tmp_dir = tempfile.mkdtemp(prefix="vtracer_")
+    input_path = ""
+    output_path = os.path.join(tmp_dir, "out.svg")
 
-    cmd = build_vtracer_cmd(
-        in_path,
-        out_path,
-        mode=mode,
-        color_precision=color_precision,
-        corner_threshold=corner_threshold,
-        filter_speckle=filter_speckle,
-    )
+    try:
+        # Normalize to PNG input
+        input_path = normalize_image_to_png(tmp_dir, file)
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=60
-    )
+        # Build and run command
+        cmd = build_vtracer_cmd(
+            input_path,
+            output_path,
+            mode=mode,
+            color_precision=color_precision,
+            corner_threshold=corner_threshold,
+            filter_speckle=filter_speckle,
+            segment_length=3.0,
+            splice_threshold=5.0,
+            hierarchical="stacked",
+        )
 
-    # failure
-    if not os.path.exists(out_path):
-        return {
-            "error": "vectorization failed",
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "cmd": cmd,
-            "snippet": result.stdout[:200] if result.stdout else "",
-        }
+        run = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
-    svg = open(out_path, "r", encoding="utf-8").read()
+        if run.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "vectorization failed",
+                    "stdout": run.stdout,
+                    "stderr": run.stderr,
+                    "cmd": cmd,
+                },
+            )
 
-    os.remove(in_path)
-    os.remove(out_path)
+        svg = read_svg_or_raise(output_path)
 
-    return {"svg": svg}
+        # Return raw SVG string in JSON
+        return JSONResponse({"svg": svg})
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
