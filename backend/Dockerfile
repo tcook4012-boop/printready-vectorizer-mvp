@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /srv/app
 
-# paths are relative to /backend
+# ✅ paths are relative to /backend (no "backend/" prefix!)
 COPY requirements.txt /srv/app/requirements.txt
 RUN pip install --no-cache-dir -r /srv/app/requirements.txt
 
