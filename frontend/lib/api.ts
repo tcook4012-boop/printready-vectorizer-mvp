@@ -1,11 +1,17 @@
 // frontend/lib/api.ts
 export type VectorizeOptions = {
-  maxColors: number;
-  smoothing: "smooth" | "sharp";
-  primitiveSnap?: boolean;         // kept for API compatibility (unused by vtracer)
-  cornerThreshold?: string;        // string; we'll coerce on the server
-  filterSpeckle?: string;          // string; we'll coerce on the server
+  maxColors: number;            // 2–8
+  smoothing: string;            // "precision" | "smooth" | etc.
+  primitiveSnap?: boolean;
+  minPathArea?: string;
+  cornerThreshold?: string;
+  filterSpeckle?: string;
 };
+
+function looksLikeSvg(s: string) {
+  // allow optional XML header then <svg ...>
+  return /^\s*(?:<\?xml[^>]*>\s*)?<svg\b/i.test(s);
+}
 
 export async function vectorizeImage(
   file: File,
@@ -18,39 +24,58 @@ export async function vectorizeImage(
 
   const fd = new FormData();
   fd.append("file", file, file.name);
-  fd.append("maxColors", String(opts.maxColors));
-  fd.append("smoothing", opts.smoothing ?? "smooth");
-  fd.append("primitiveSnap", String(Boolean(opts.primitiveSnap)));
-  if (opts.cornerThreshold != null) fd.append("cornerThreshold", String(opts.cornerThreshold));
-  if (opts.filterSpeckle != null)   fd.append("filterSpeckle", String(opts.filterSpeckle));
+  fd.append("max_colors", String(opts.maxColors));
+  fd.append("smoothing", String(opts.smoothing ?? "precision"));
+  if (opts.primitiveSnap != null) fd.append("primitive_snap", String(!!opts.primitiveSnap));
+  if (opts.minPathArea != null) fd.append("min_path_area", String(opts.minPathArea));
+  if (opts.cornerThreshold != null) fd.append("corner_threshold", String(opts.cornerThreshold));
+  if (opts.filterSpeckle != null) fd.append("filter_speckle", String(opts.filterSpeckle));
 
   const res = await fetch(url, {
     method: "POST",
     body: fd,
+    headers: {
+      // Hint servers to return either JSON or SVG; we'll accept both.
+      "Accept": "application/json, image/svg+xml, text/plain;q=0.9, */*;q=0.8",
+    },
   });
 
-  // If the backend throws, it returns JSON with 'detail'
-  const text = await res.text();
-  let data: any = null;
+  const ctype = res.headers.get("content-type") || "";
+
+  // If the server sent raw SVG text
+  if (ctype.includes("image/svg+xml") || ctype.startsWith("text/plain")) {
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`Vectorize failed (${res.status}): ${text.slice(0, 180)}`);
+    }
+    if (!looksLikeSvg(text)) {
+      throw new Error(`Bad response from API (not SVG): ${text.slice(0, 180)}`);
+    }
+    return text;
+  }
+
+  // Otherwise try JSON
+  let json: any;
   try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Bad response from API (not JSON): ${text.slice(0, 200)}`);
-  }
-
-  if (!res.ok) {
-    // Pass through backend diagnostics
-    const msg = data?.detail ? JSON.stringify(data.detail) : text;
-    throw new Error(msg);
-  }
-
-  const svg = data?.svg;
-  if (!svg || typeof svg !== "string" || !svg.toLowerCase().includes("<svg")) {
-    const snippet = typeof svg === "string" ? svg.slice(0, 200) : "";
+    json = await res.json();
+  } catch (e) {
+    const fallback = await res.text().catch(() => "");
     throw new Error(
-      JSON.stringify({ error: "Empty SVG payload from server", snippet })
+      `Bad response from API (not JSON): ${fallback.slice(0, 180)}`
     );
   }
 
+  if (!res.ok) {
+    // Bubble up server error details if present
+    const detail = json?.detail ?? json?.error ?? json;
+    throw new Error(
+      `Vectorize failed (${res.status}): ${typeof detail === "string" ? detail : JSON.stringify(detail)}`
+    );
+  }
+
+  const svg = json?.svg ?? json?.data ?? json?.body;
+  if (!svg || !looksLikeSvg(svg)) {
+    throw new Error("Empty or invalid SVG payload from API.");
+  }
   return svg;
 }
