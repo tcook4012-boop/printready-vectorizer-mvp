@@ -1,137 +1,104 @@
-import os
-import tempfile
-import subprocess
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from tempfile import NamedTemporaryFile
+import subprocess
+import shutil
+import os
 
 app = FastAPI()
 
-# Allow browser requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------- Utility: map maxColors → color precision (vtracer expects bits) ----------
-def _bits_from_colors(n: int) -> int:
-    if n <= 2:
-        return 1
-    import math
-    return max(1, min(8, int(round(math.log2(max(2, n))))))
+def build_vtracer_cmd(input_path, output_path, mode, max_colors, smoothing, primitive_snap, corner_threshold, filter_speckle, thin_lines):
+    mode_flag = "polygon"
+    if smoothing == "smooth":
+        mode_flag = "spline"
 
-# ----------- Build vtracer command safely -----------
-def build_vtracer_cmd(
-    input_path: str,
-    output_path: str,
-    *,
-    mode: str = "spline",
-    max_colors: int = 16,
-    corner_threshold: float = 30.0,
-    filter_speckle: int = 4,
-    segment_length: float = None,
-    splice_threshold: float = None,
-    hierarchical: str = None,
-):
+    # ✅ Convert corner threshold to integer only
+    try:
+        corner_int = int(float(corner_threshold))
+    except:
+        corner_int = 10
+
     cmd = [
         "vtracer",
         "--input", input_path,
         "--output", output_path,
-        "--mode", mode,
-        "-p", str(_bits_from_colors(max_colors)),
-        "-c", str(corner_threshold),
-        "-f", str(filter_speckle),
+        "--mode", mode_flag,
+        "-p", str(max_colors),          # max_colors
+        "-c", str(corner_int),          # ✅ integer only
+        "-f", str(filter_speckle or 4), # remove small artifacts
+        "-l", "3.0",                    # segment length smoothing
+        "-s", "5.0",                    # splice threshold
+        "--hierarchical", "stacked"
     ]
 
-    if segment_length is not None:
-        cmd += ["-l", str(segment_length)]
-
-    if splice_threshold is not None:
-        cmd += ["-s", str(splice_threshold)]
-
-    if hierarchical in ("stacked", "cutout"):
-        cmd += ["--hierarchical", hierarchical]
+    if thin_lines:
+        cmd.append("--thin-lines")
 
     return cmd
 
-# ----------- ROUTE: /vectorize ---------------------
+
 @app.post("/vectorize")
 async def vectorize(
     file: UploadFile = File(...),
-    max_colors: int = Form(12),
-    smoothing: str = Form("spline"),     # allowed: spline, polygon, pixel
-    corner_threshold: float = Form(30.0),
-    filter_speckle: int = Form(4),
+    maxColors: int = Form(4),
+    smoothing: str = Form("smooth"),
+    primitiveSnap: bool = Form(False),
+    cornerThreshold: str = Form("10"),
+    filterSpeckle: int = Form(4),
+    thinLines: bool = Form(False),
 ):
-    # Save uploaded file to temp
+    # save upload
+    with NamedTemporaryFile(delete=False, suffix=".png") as tmp_in:
+        shutil.copyfileobj(file.file, tmp_in)
+        input_path = tmp_in.name
+
+    output_path = input_path.replace(".png", ".svg")
+
+    cmd = build_vtracer_cmd(
+        input_path,
+        output_path,
+        mode=None,
+        max_colors=maxColors,
+        smoothing=smoothing,
+        primitive_snap=primitiveSnap,
+        corner_threshold=cornerThreshold,
+        filter_speckle=filterSpeckle,
+        thin_lines=thinLines,
+    )
+
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_in:
-            tmp_in.write(await file.read())
-            input_path = tmp_in.name
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".svg") as tmp_out:
-            output_path = tmp_out.name
-
-        # Map "smoothing" to actual vtracer modes
-        mode = smoothing.lower()
-        if mode not in ["spline", "polygon", "pixel"]:
-            mode = "spline"
-
-        # Build the vtracer command
-        cmd = build_vtracer_cmd(
-            input_path=input_path,
-            output_path=output_path,
-            mode=mode,
-            max_colors=max_colors,
-            corner_threshold=corner_threshold,
-            filter_speckle=filter_speckle,
-            segment_length=3.0,     # helps edges
-            splice_threshold=5.0,   # reduces jagged micro-corners
-            hierarchical="stacked",
-        )
-
-        # Run it
-        proc = subprocess.run(
+        result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
+            timeout=60
         )
+    except Exception as e:
+        return {"error": "failed to execute vtracer", "exception": str(e)}
 
-        # If vtracer errors
-        if proc.returncode != 0:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "detail": {
-                        "error": "vectorization failed",
-                        "stdout": proc.stdout,
-                        "stderr": proc.stderr,
-                        "cmd": cmd,
-                    }
-                },
-            )
+    if not os.path.exists(output_path):
+        return {
+            "error": "vectorization failed",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "cmd": cmd,
+        }
 
-        # Return SVG text
-        with open(output_path, "r", encoding="utf-8") as f:
-            svg_data = f.read()
+    svg_data = open(output_path, "r", encoding="utf-8").read()
 
-        return {"svg": svg_data}
+    os.remove(input_path)
+    os.remove(output_path)
 
-    finally:
-        # Clean up temp files
-        try:
-            os.remove(input_path)
-        except:
-            pass
-        try:
-            os.remove(output_path)
-        except:
-            pass
+    return {"svg": svg_data}
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Vectorizer API is running"}
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
