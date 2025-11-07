@@ -1,35 +1,41 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
-import tempfile, subprocess, os, shutil, re
+# backend/app/main.py
+import os
+import shutil
+import subprocess
+import tempfile
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 app = FastAPI()
 
-# --- CORS: allow your Vercel origin (or temporarily "*") ---
-origins = [
-    "https://printready-vectorizer-mvp.vercel.app",
-    "http://localhost:3000",
-    # "https://*vercel.app",  # optional wildcard while testing
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins or ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def build_cmd(
+    inp: str,
+    outp: str,
+    *,
+    mode: str = "polygon",            # "polygon" | "spline" | "color" (color mode ignored here)
+    max_colors: int = 4,
+    corner_threshold: float = 30.0,
+    filter_speckle: int = 4,
+):
+    # vtracer 0.6.5 flags that actually exist:
+    # --mode, --color_precision, --corner_threshold, --filter_speckle, --input, --output
+    return [
+        "vtracer",
+        "--input", inp,
+        "--output", outp,
+        "--mode", mode,
+        "--color_precision", str(max_colors),
+        "--corner_threshold", str(int(corner_threshold)),  # must be integer-like for this build
+        "--filter_speckle", str(int(filter_speckle)),
+    ]
 
-# ---- Health + root (so browser tests don’t show 404) ----
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "ok"
-
-@app.get("/healthz", response_class=PlainTextResponse)
-def healthz():
-    return "ok"
-
-# ---- your existing /vectorize POST stays the same ----
-svg_root_re = re.compile(r"<svg\b[^>]*>", re.I)
+def save_upload_to_temp(upload: UploadFile, suffix: str = ".jpg") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as tmp:
+        shutil.copyfileobj(upload.file, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    return path
 
 @app.post("/vectorize", response_class=PlainTextResponse)
 async def vectorize(
@@ -37,47 +43,57 @@ async def vectorize(
     max_colors: int = Form(4),
     smoothing: str = Form("precision"),
     primitive_snap: bool = Form(False),
-    min_path_area: float = Form(0.0002),
-    corner_threshold: float = Form(30.0),
-    filter_speckle: int = Form(4),
+    min_path_area: str = Form(None),
+    corner_threshold: str = Form("30"),
+    filter_speckle: str = Form("4"),
 ):
+    # pick extension from content-type (fallback .jpg)
+    ext = ".png" if (file.content_type or "").lower().endswith("png") else ".jpg"
+    in_path = save_upload_to_temp(file, suffix=ext)
+    out_path = tempfile.mktemp(suffix=".svg")
+
+    # map UI smoothing to vtracer mode
+    mode = "spline" if smoothing in ("smooth", "spline") else "polygon"
+
     try:
-        with tempfile.TemporaryDirectory() as td:
-            in_path = os.path.join(td, "input.jpg")
-            out_path = os.path.join(td, "out.svg")
-            with open(in_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
+        cmd = build_cmd(
+            in_path,
+            out_path,
+            mode=mode,
+            max_colors=int(max_colors),
+            corner_threshold=float(corner_threshold or 30),
+            filter_speckle=int(filter_speckle or 4),
+        )
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
-            mode = "spline" if smoothing in ("smooth", "high") else "polygon"
-            cmd = [
-                "vtracer",
-                "--input", in_path,
-                "--output", out_path,
-                "--mode", mode,
-                "--color_precision", str(max_colors),
-                "--corner_threshold", str(int(corner_threshold)),
-                "--filter_speckle", str(int(filter_speckle)),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                raise HTTPException(
-                    500,
-                    detail={
-                        "error": "vectorization failed",
-                        "stdout": proc.stdout,
-                        "stderr": proc.stderr,
-                        "cmd": cmd,
-                    },
-                )
+        if proc.returncode != 0:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "vectorization failed",
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                    "cmd": cmd,
+                },
+            )
 
-            svg_text = open(out_path, "r", encoding="utf-8", errors="ignore").read()
-            if not svg_root_re.search(svg_text):
-                snippet = svg_text[:180].replace("\n", " ")
-                raise HTTPException(500, detail={"error": "output is not an <svg> root", "snippet": snippet})
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "empty svg", "cmd": cmd},
+            )
 
-            return PlainTextResponse(svg_text, media_type="image/svg+xml")
+        with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
+            svg = f.read()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, detail={"error": str(e)})
+        # Return raw SVG text (frontend now supports raw SVG or JSON)
+        return PlainTextResponse(svg, media_type="image/svg+xml")
+
+    finally:
+        # cleanup
+        try:
+            if os.path.exists(in_path): os.remove(in_path)
+        except: pass
+        try:
+            if os.path.exists(out_path): os.remove(out_path)
+        except: pass
