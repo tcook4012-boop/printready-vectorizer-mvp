@@ -91,3 +91,4 @@ export async function vectorizeImage(
   if (!svg || !looksLikeSvg(svg)) throw new Error("Empty SVG payload.");
   return svg;
 }
+
