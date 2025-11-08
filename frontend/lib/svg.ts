@@ -1,32 +1,39 @@
-// ✅ NEW svg.ts (drop-in replacement)
-// Accepts raw SVG text — returns clean SVG string
-// Handles DOCTYPE, XML header, comments, whitespace, etc.
+// lib/svg.ts
 
-export function normalizeSvg(raw: string): string {
-  if (!raw) return "";
+export function normalizeSvg(svg: string): string {
+  if (!svg) return "";
 
-  let svg = raw.trim();
+  // Remove BOM, XML prolog, DOCTYPE, and comments
+  let cleaned = svg
+    .replace(/^\uFEFF/, "")
+    .replace(/<\?xml[^>]*\?>/gi, "")
+    .replace(/<!DOCTYPE[^>]*>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .trim();
 
-  // Remove XML header or DOCTYPE — browser doesn’t need it
-  svg = svg.replace(/<\?xml[^>]*>/gi, "");
-  svg = svg.replace(/<!DOCTYPE[^>]*>/gi, "");
+  // Ensure it actually contains <svg>
+  if (!/<svg[\s>]/i.test(cleaned)) {
+    throw new Error("SVG parse error: output does not contain <svg>");
+  }
 
-  // Remove HTML comments
-  svg = svg.replace(/<!--[\s\S]*?-->/g, "");
+  // Add viewBox if missing (helps scaling)
+  if (!/viewBox=/i.test(cleaned)) {
+    cleaned = cleaned.replace(
+      /<svg([^>]*)>/i,
+      (match, attrs) => {
+        const widthMatch = attrs.match(/width="([^"]+)"/i);
+        const heightMatch = attrs.match(/height="([^"]+)"/i);
+        if (widthMatch && heightMatch) {
+          const w = parseFloat(widthMatch[1]);
+          const h = parseFloat(heightMatch[1]);
+          if (!isNaN(w) && !isNaN(h)) {
+            return `<svg${attrs} viewBox="0 0 ${w} ${h}">`;
+          }
+        }
+        return match;
+      }
+    );
+  }
 
-  // Find first <svg ...> tag
-  const idx = svg.toLowerCase().indexOf("<svg");
-  if (idx > 0) svg = svg.slice(idx);
-
-  // Remove trailing junk after </svg>
-  const endIdx = svg.toLowerCase().lastIndexOf("</svg>");
-  if (endIdx > 0) svg = svg.slice(0, endIdx + 6);
-
-  return svg.trim();
-}
-
-// ✅ Optional: simple validator
-export function looksLikeSvg(s: string): boolean {
-  if (!s) return false;
-  return /<svg\b/i.test(s);
+  return cleaned;
 }
