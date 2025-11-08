@@ -2,46 +2,43 @@ import os
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from typing import List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
+# -------------------------------------------------
+# App + CORS (allow the Vercel frontend)
+# -------------------------------------------------
 app = FastAPI(title="PrintReady Vectorizer API")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# Keep it open for now (simple + reliable). If you want to restrict later,
+# replace ["*"] with ["https://printready-vectorizer-mvp.vercel.app", "http://localhost:3000"].
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------
+# Utilities
+# -------------------------------------------------
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
-def _exists_and_nonempty(path: str) -> bool:
+def _exists_nonempty(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
-def _have_potrace_stack() -> bool:
-    # Potrace path relies on potrace; mkbitmap and convert are very helpful, but only potrace is strictly required.
-    return _which("potrace") is not None
+def _have(name: str) -> bool:
+    return _which(name) is not None
 
-def _have_mkbitmap() -> bool:
-    return _which("mkbitmap") is not None
-
-def _have_convert() -> bool:
-    return _which("convert") is not None
-
-def save_upload_to_temp(upload: UploadFile, suffix: str = ".jpg") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as tmp:
-        shutil.copyfileobj(upload.file, tmp)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-    return path
-
-def _clean_temp(paths: List[str]):
+def _clean(paths: List[str]):
     for p in paths:
         try:
             if p and os.path.exists(p):
@@ -49,12 +46,18 @@ def _clean_temp(paths: List[str]):
         except:
             pass
 
-# -----------------------------
-# VTracer driver
-# -----------------------------
-def vtracer_cmd(inp: str, outp: str, *, mode: str = "polygon",
-                max_colors: int = 4, corner_threshold: float = 30.0,
-                filter_speckle: int = 4) -> List[str]:
+def _save_upload(upload: UploadFile, suffix: str = ".jpg") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(fd, "wb") as tmp:
+        shutil.copyfileobj(upload.file, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    return path
+
+# -------------------------------------------------
+# Engines
+# -------------------------------------------------
+def vtracer_cmd(inp: str, outp: str, *, mode: str, max_colors: int, corner_threshold: float, filter_speckle: int) -> List[str]:
     return [
         "vtracer",
         "--input", inp,
@@ -65,68 +68,85 @@ def vtracer_cmd(inp: str, outp: str, *, mode: str = "polygon",
         "--filter_speckle", str(int(filter_speckle)),
     ]
 
-# -----------------------------
-# Potrace driver (with optional mkbitmap/convert)
-# -----------------------------
-def potrace_svg(inp: str, outp: str, *, threshold: Optional[int] = None) -> subprocess.CompletedProcess:
-    work_inp = inp
-    temp_binarized = None
-    temp_pgm = None
+def _imagemagick_bin() -> Optional[str]:
+    # IM7 commonly ships as "magick", but Debian also gives "convert" via alternatives
+    if _have("magick"):
+        return "magick"
+    if _have("convert"):
+        return "convert"
+    return None
+
+def _to_pgm_with_imagemagick(inp: str, out_pgm: str, threshold: Optional[int]) -> subprocess.CompletedProcess:
+    im = _imagemagick_bin()
+    if not im:
+        # no ImageMagick — tell caller we couldn't run
+        return subprocess.CompletedProcess(args=["convert"], returncode=127, stdout="", stderr="ImageMagick not found")
+
+    # Use Otsu automatically unless an explicit threshold (0..100) is provided
+    if threshold is None:
+        # Auto-threshold (Otsu) → grayscale → PGM
+        cmd = [im, inp, "-colorspace", "Gray", "-auto-threshold", "Otsu", out_pgm]
+    else:
+        # Explicit % threshold
+        cmd = [im, inp, "-colorspace", "Gray", "-threshold", f"{threshold}%", out_pgm]
+
+    return _run(cmd)
+
+def potrace_pipeline(inp: str, out_svg: str, threshold: Optional[int]) -> subprocess.CompletedProcess:
+    """
+    JPG/PNG → (IM) PGM → (optional mkbitmap smoothing) → Potrace → SVG
+    """
+    pgm = tempfile.mktemp(suffix=".pgm")
+    smoothed = None
+
     try:
-        # optional binarization via ImageMagick
-        if threshold is not None and _have_convert():
-            temp_binarized = tempfile.mktemp(suffix=".png")
-            proc_m = _run(["convert", inp, "-colorspace", "Gray", "-threshold", f"{threshold}%", temp_binarized])
-            if proc_m.returncode == 0 and _exists_and_nonempty(temp_binarized):
-                work_inp = temp_binarized
+        # Step 1: raster → PGM
+        proc_conv = _to_pgm_with_imagemagick(inp, pgm, threshold)
+        if proc_conv.returncode != 0 or not _exists_nonempty(pgm):
+            return subprocess.CompletedProcess(args=["convert"], returncode=1, stdout=proc_conv.stdout,
+                                              stderr=f"IM conversion failed: {proc_conv.stderr}")
 
-        # optional smoothing via mkbitmap
-        if _have_mkbitmap():
-            temp_pgm = tempfile.mktemp(suffix=".pgm")
-            proc_bm = _run(["mkbitmap", "-f", "4", "-s", "2", "-o", temp_pgm, work_inp])
-            if proc_bm.returncode == 0 and _exists_and_nonempty(temp_pgm):
-                return _run(["potrace", "-s", "-o", outp, temp_pgm])
+        # Step 2 (optional): mkbitmap smoothing/feathering
+        work_pgm = pgm
+        if _have("mkbitmap"):
+            smoothed = tempfile.mktemp(suffix=".pgm")
+            # -f 4 (feather), -s 2 (smooth) are good defaults for logo scans
+            proc_mkb = _run(["mkbitmap", "-f", "4", "-s", "2", "-o", smoothed, pgm])
+            if proc_mkb.returncode == 0 and _exists_nonempty(smoothed):
+                work_pgm = smoothed  # use the smoothed version
 
-        # fallback: potrace directly
-        return _run(["potrace", "-s", "-o", outp, work_inp])
+        # Step 3: potrace → SVG
+        return _run(["potrace", "-s", "-o", out_svg, work_pgm])
+
     finally:
-        for p in (temp_binarized, temp_pgm):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except:
-                pass
+        _clean([pgm, smoothed] if smoothed else [pgm])
 
-# -----------------------------
-# Engine selection
-# -----------------------------
 def choose_engine(engine: str, max_colors: int, smoothing: str) -> str:
     e = (engine or "auto").lower()
     if e in ("vtracer", "potrace"):
         return e
-    # auto:
-    # prefer potrace for <=2 colors or "precision", BUT only if potrace is available
-    if (max_colors <= 2 or smoothing == "precision") and _have_potrace_stack():
+    # auto: prefer Potrace for very low color counts — but only if potrace + IM exist
+    if max_colors <= 2 and _have("potrace") and _imagemagick_bin():
         return "potrace"
     return "vtracer"
 
-# -----------------------------
-# API: single vectorize
-# -----------------------------
+# -------------------------------------------------
+# API: /vectorize
+# -------------------------------------------------
 @app.post("/vectorize", response_class=PlainTextResponse)
 async def vectorize(
     file: UploadFile = File(...),
     max_colors: int = Form(4),
-    smoothing: str = Form("precision"),  # "precision" | "smooth"
+    smoothing: str = Form("precision"),   # "precision" | "smooth"
     primitive_snap: bool = Form(False),
     min_path_area: str = Form(None),
     corner_threshold: str = Form("30"),
     filter_speckle: str = Form("4"),
-    engine: str = Form("auto"),          # "auto" | "vtracer" | "potrace"
-    threshold: str = Form(None),         # Potrace threshold (%)
+    engine: str = Form("auto"),           # "auto" | "vtracer" | "potrace"
+    threshold: str = Form(None),          # Potrace threshold (0..100), else auto (Otsu)
 ):
     ext = ".png" if (file.content_type or "").lower().endswith("png") else ".jpg"
-    in_path = save_upload_to_temp(file, suffix=ext)
+    in_path = _save_upload(file, suffix=ext)
     out_path = tempfile.mktemp(suffix=".svg")
 
     selected = choose_engine(engine, int(max_colors), smoothing)
@@ -143,88 +163,23 @@ async def vectorize(
             )
             proc = _run(cmd)
         else:
-            thr = int(threshold) if threshold is not None and str(threshold).isdigit() else None
-            cmd = ["potrace", "(auto)"]
-            proc = potrace_svg(in_path, out_path, threshold=thr)
+            thr = int(threshold) if (threshold and str(threshold).isdigit()) else None
+            proc = potrace_pipeline(in_path, out_path, thr)
+            cmd = ["potrace", "(pipeline)"]
 
         if proc.returncode != 0:
             return JSONResponse(status_code=500, content={
                 "error": "vectorization failed",
-                "stdout": proc.stdout, "stderr": proc.stderr, "cmd": cmd
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "cmd": cmd
             })
 
-        if not _exists_and_nonempty(out_path):
+        if not _exists_nonempty(out_path):
             return JSONResponse(status_code=500, content={"error": "empty svg", "cmd": cmd})
 
         with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
             svg = f.read()
         return PlainTextResponse(svg, media_type="image/svg+xml")
     finally:
-        _clean_temp([in_path, out_path])
-
-# -----------------------------
-# API: batch → ZIP
-# -----------------------------
-@app.post("/batch")
-async def batch_vectorize(
-    files: List[UploadFile] = File(...),
-    max_colors: int = Form(4),
-    smoothing: str = Form("precision"),
-    corner_threshold: str = Form("30"),
-    filter_speckle: str = Form("4"),
-    engine: str = Form("auto"),
-    threshold: str = Form(None),
-):
-    tmp_dir = tempfile.mkdtemp(prefix="vec_batch_")
-    zip_path = os.path.join(tmp_dir, "result.zip")
-    cleanup_paths = [zip_path, tmp_dir]
-
-    try:
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for idx, upload in enumerate(files):
-                name_base = os.path.splitext(upload.filename or f"file_{idx}")[0]
-                ext = ".png" if (upload.content_type or "").lower().endswith("png") else ".jpg"
-                in_path = save_upload_to_temp(upload, suffix=ext)
-                out_path = os.path.join(tmp_dir, f"{name_base}.svg")
-
-                selected = choose_engine(engine, int(max_colors), smoothing)
-                mode = "spline" if smoothing in ("smooth", "spline") else "polygon"
-
-                if selected == "vtracer":
-                    cmd = vtracer_cmd(
-                        in_path, out_path,
-                        mode=mode,
-                        max_colors=int(max_colors),
-                        corner_threshold=float(corner_threshold or 30),
-                        filter_speckle=int(filter_speckle or 4),
-                    )
-                    proc = _run(cmd)
-                else:
-                    thr = int(threshold) if threshold is not None and str(threshold).isdigit() else None
-                    proc = potrace_svg(in_path, out_path, threshold=thr)
-
-                if proc.returncode != 0 or not _exists_and_nonempty(out_path):
-                    err_txt = os.path.join(tmp_dir, f"{name_base}__ERROR.txt")
-                    with open(err_txt, "w", encoding="utf-8") as ef:
-                        ef.write(
-                            f"Vectorization failed for {upload.filename}\n\n"
-                            f"stdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n"
-                        )
-                    zf.write(err_txt, arcname=os.path.basename(err_txt))
-                else:
-                    zf.write(out_path, arcname=os.path.basename(out_path))
-
-                _clean_temp([in_path])  # keep svg until zipped
-
-        def _cleanup():
-            _clean_temp(cleanup_paths)
-
-        return StreamingResponse(
-            open(zip_path, "rb"),
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=vectorized.zip"},
-            background=BackgroundTask(_cleanup),
-        )
-    except Exception as e:
-        _clean_temp(cleanup_paths)
-        return JSONResponse(status_code=500, content={"error": f"batch failed: {e}"})
+        _clean([in_path, out_path])
