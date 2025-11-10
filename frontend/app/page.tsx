@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { vectorizeImage } from "../lib/api";
 import { normalizeSvg } from "../lib/svg";
 
@@ -7,14 +7,22 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
-  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">("medium");
+  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">(
+    "medium"
+  );
   const [minPathArea, setMinPathArea] = useState(0.0005);
-  const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">("light_to_dark");
+  const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">(
+    "light_to_dark"
+  );
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [svg, setSvg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Preview helpers
+  const [zoom, setZoom] = useState<number>(100); // %
+  const zoomScale = useMemo(() => Math.max(0.25, Math.min(2, zoom / 100)), [zoom]);
 
   const handleVectorize = async () => {
     if (!file) {
@@ -37,9 +45,8 @@ export default function Home() {
 
       const cleaned = normalizeSvg(rawSvg);
 
-      // If backend returns non-SVG, surface it to UI
       if (!cleaned || !cleaned.toLowerCase().includes("<svg")) {
-        console.warn("Non-SVG API response:", rawSvg?.slice(0, 500));
+        console.warn("Non-SVG API response:", String(rawSvg)?.slice(0, 500));
         setError(
           "API did not return embeddable SVG. First 300 chars:\n" +
             String(rawSvg).slice(0, 300)
@@ -48,6 +55,8 @@ export default function Home() {
       }
 
       setSvg(cleaned);
+      // try to start preview fit-ish
+      setZoom(100);
     } catch (e: any) {
       const msg = String(e?.message || e);
       setError(
@@ -72,7 +81,7 @@ export default function Home() {
   };
 
   return (
-    <main style={{ padding: 20, maxWidth: 900 }}>
+    <main style={{ padding: 20, maxWidth: 1100, margin: "0 auto" }}>
       <h1>PrintReady Vectorizer</h1>
 
       <input
@@ -111,7 +120,7 @@ export default function Home() {
             checked={primitiveSnap}
             onChange={(e) => setPrimitiveSnap(e.target.checked)}
           />
-          Primitive Snap
+          {" "}Primitive Snap
         </label>
       </div>
 
@@ -139,7 +148,10 @@ export default function Home() {
 
           <div style={{ marginTop: 8 }}>
             <label>Layer Order: </label>
-            <select value={order} onChange={(e) => setOrder(e.target.value as any)}>
+            <select
+              value={order}
+              onChange={(e) => setOrder(e.target.value as any)}
+            >
               <option value="light_to_dark">Light → Dark</option>
               <option value="dark_to_light">Dark → Light</option>
             </select>
@@ -163,18 +175,51 @@ export default function Home() {
       {/* SVG Output */}
       {svg && (
         <>
-          <h3>Output:</h3>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 18 }}>
+            <h3 style={{ margin: 0 }}>Output:</h3>
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              Zoom:
+              <input
+                type="range"
+                min={25}
+                max={200}
+                step={5}
+                value={zoom}
+                onChange={(e) => setZoom(Number(e.target.value))}
+              />
+              <span style={{ width: 48, textAlign: "right" }}>{zoom}%</span>
+            </label>
+            <button onClick={() => setZoom(100)}>100%</button>
+            <button onClick={() => setZoom(200)}>200%</button>
+            <button onClick={() => setZoom(75)}>Fit-ish</button>
+          </div>
+
+          {/* Scrollable preview area */}
           <div
             style={{
               border: "1px solid #999",
-              width: 600,
-              height: 500,
-              overflow: "hidden",
+              maxWidth: "100%",
+              height: "70vh",
+              overflow: "auto",             // <-- scrollbars appear as needed
               background: "#fff",
+              marginTop: 8,
+              padding: 12,
             }}
-            dangerouslySetInnerHTML={{ __html: svg }}
-          />
-          <button onClick={downloadSvg} style={{ marginTop: 8 }}>
+          >
+            {/* scale the SVG inside, but keep natural size so scrollbars work */}
+            <div
+              style={{
+                transform: `scale(${zoomScale})`,
+                transformOrigin: "top left",
+                width: "max-content",       // allows scroll of scaled content
+                height: "max-content",
+              }}
+              // NOTE: we purposely render the raw SVG markup
+              dangerouslySetInnerHTML={{ __html: svg }}
+            />
+          </div>
+
+          <button onClick={downloadSvg} style={{ marginTop: 10 }}>
             Download SVG
           </button>
         </>
