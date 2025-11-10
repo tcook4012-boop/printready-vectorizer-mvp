@@ -1,113 +1,101 @@
+// frontend/lib/svg.ts
+
 /**
- * SVG utilities — make SVG safe & embeddable in the DOM.
- * - Accepts raw SVG (with or without XML header/comments)
- * - Handles namespaced tags like <ns0:svg> and <ns0:path>
- * - Ensures root <svg> has a normal xmlns
- * - Optionally enforces a max size to avoid layout explosions
+ * Quick check: does a string look like SVG markup?
  */
-
-const SVG_XMLNS = "http://www.w3.org/2000/svg";
-
-/** Heuristic: does the text look like SVG (even if namespaced / has XML header/comments)? */
-export function looksLikeSvg(txt: string): boolean {
-  if (!txt) return false;
-  // Allow optional XML header and comments, then a <svg or <nsX:svg start
-  return /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<([a-zA-Z0-9_-]+:)?svg\b/i.test(txt);
+export function looksLikeSvg(markup: string): boolean {
+  return /<\s*svg[\s>]/i.test(markup) || /<\s*[\w:]+:svg[\s>]/i.test(markup);
 }
 
-/** Strip all XML namespace prefixes like ns0:, svg:, xlink:, etc. from *element* names and attributes. */
-function stripNamespacePrefixes(svg: string): string {
-  let s = svg;
+/**
+ * Normalize SVG markup so it:
+ *  - has a plain <svg> root (no ns0:svg etc.)
+ *  - removes XML prolog/DOCTYPE
+ *  - guarantees a viewBox (so it scales correctly)
+ *  - strips explicit width/height so CSS can size it
+ *  - removes <script> and on* handlers for safety
+ *  - sets preserveAspectRatio="xMidYMid meet"
+ *
+ * Returns the cleaned SVG as a string. If the input wasn’t SVG,
+ * this returns the original string unmodified.
+ */
+export function normalizeSvg(raw: string): string {
+  if (!raw || typeof raw !== "string") return raw;
 
-  // 1) Remove xmlns:* declarations entirely (we'll re-add the default xmlns below)
-  //    e.g., xmlns:ns0="http://www.w3.org/2000/svg"
-  s = s.replace(/\s+xmlns:[a-zA-Z0-9_-]+="[^"]*"/g, "");
+  let s = raw.trim();
 
-  // 2) Remove tag name prefixes on open/close tags: <ns0:path ...> -> <path ...>, </ns0:g> -> </g>
-  s = s.replace(/<\/\s*([a-zA-Z0-9_-]+):/g, "</"); // closing tags
-  s = s.replace(/<\s*([a-zA-Z0-9_-]+):/g, "<");    // opening tags
+  // Remove XML prolog and DOCTYPE (they can confuse innerHTML)
+  s = s.replace(/<\?xml[\s\S]*?\?>/gi, "");
+  s = s.replace(/<!DOCTYPE[\s\S]*?>/gi, "");
 
-  // 3) Remove attribute name prefixes: ns0:href="..." -> href="..."
-  s = s.replace(/\s([a-zA-Z0-9_-]+):([a-zA-Z0-9_-]+)=/g, " $2=");
+  // If the tool emitted a namespaced root like <ns0:svg ...>
+  // normalize it to a vanilla <svg ...>
+  // 1) Opening tag
+  s = s.replace(/<\s*([\w-]+):svg([\s>])/i, "<svg$2");
+  // 2) Closing tag
+  s = s.replace(/<\/\s*([\w-]+):svg\s*>/i, "</svg>");
+  // 3) Any other prefixed elements like <ns0:path> -> <path>
+  s = s.replace(/<\s*([\w-]+):([a-z0-9_-]+)(\s|>)/gi, "<$2$3");
+  s = s.replace(/<\/\s*([\w-]+):([a-z0-9_-]+)\s*>/gi, "</$2>");
 
-  return s;
-}
+  // Now locate the root <svg ...> tag
+  const openSvgMatch = s.match(/<\s*svg\b[^>]*>/i);
+  if (!openSvgMatch) return raw; // not SVG—return as-is
 
-/** Ensure the root <svg> tag is present and has a proper default xmlns. */
-function ensureDefaultXmlns(svg: string): string {
-  // Normalize whitespace on the opening svg tag to check/add xmlns=
-  return svg.replace(
-    /<svg\b([^>]*)>/i,
-    (m, attrs) => {
-      const hasXmlns = /\sxmlns\s*=/.test(attrs);
-      const cleaned = attrs
-        // Remove duplicate width/height if they appear multiple times
-        .replace(/\s(width|height)\s*=\s*("[^"]*"|'[^']*')/g, (mm, n, v) => ` ${n}=${v}`)
-        .trim();
+  let openSvg = openSvgMatch[0];
 
-      return hasXmlns
-        ? `<svg ${cleaned}>`
-        : `<svg xmlns="${SVG_XMLNS}" ${cleaned}>`;
+  // Strip any inline event handlers: onload, onclick, etc.
+  openSvg = openSvg.replace(/\s+on[a-z]+\s*=\s*(['"]).*?\1/gi, "");
+
+  // Ensure preserveAspectRatio
+  if (!/preserveAspectRatio=/i.test(openSvg)) {
+    openSvg = openSvg.replace(
+      /<\s*svg/i,
+      '<svg preserveAspectRatio="xMidYMid meet"'
+    );
+  }
+
+  // Extract width/height if present so we can build a viewBox
+  const widthMatch = openSvg.match(/\bwidth\s*=\s*['"]?([0-9.]+)(px)?['"]?/i);
+  const heightMatch = openSvg.match(/\bheight\s*=\s*['"]?([0-9.]+)(px)?['"]?/i);
+  const viewBoxMatch = openSvg.match(/\bviewBox\s*=\s*['"]([^'"]+)['"]/i);
+
+  // If no viewBox, create one from width/height if possible
+  if (!viewBoxMatch) {
+    const w = widthMatch ? parseFloat(widthMatch[1]) : NaN;
+    const h = heightMatch ? parseFloat(heightMatch[1]) : NaN;
+    if (isFinite(w) && isFinite(h) && w > 0 && h > 0) {
+      openSvg = openSvg.replace(
+        /<\s*svg/i,
+        `<svg viewBox="0 0 ${w} ${h}"`
+      );
+    } else {
+      // Fallback if we can’t infer—use a square viewBox
+      openSvg = openSvg.replace(
+        /<\s*svg/i,
+        `<svg viewBox="0 0 1024 1024"`
+      );
     }
-  );
-}
-
-/** Optional: Cap absurdly huge width/height while preserving viewBox if present. */
-function capHugeDimensions(svg: string, max = 4000): string {
-  // If there's a viewBox, we can safely drop explicit width/height (let CSS control it).
-  const hasViewBox = /<svg\b[^>]*\bviewBox\s*=\s*["'][^"']*["']/i.test(svg);
-  if (hasViewBox) {
-    return svg
-      .replace(/\swidth\s*=\s*("[^"]*"|'[^']*')/i, "")
-      .replace(/\sheight\s*=\s*("[^"]*"|'[^']*')/i, "");
-  }
-  // Otherwise clamp numeric width/height if they’re outrageous
-  const clamp = (val: string) => {
-    const n = parseFloat(val);
-    if (Number.isFinite(n) && n > max) return String(max);
-    return val;
-  };
-  return svg
-    .replace(/\swidth\s*=\s*"(\d+(?:\.\d+)?)"/i, (_m, v) => ` width="${clamp(v)}"`)
-    .replace(/\sheight\s*=\s*"(\d+(?:\.\d+)?)"/i, (_m, v) => ` height="${clamp(v)}"`);
-}
-
-/** Remove XML header and leading comments so we can safely innerHTML this. */
-function stripXmlPrologAndComments(svg: string): string {
-  return svg
-    .replace(/^\s*<\?xml[\s\S]*?\?>\s*/i, "")
-    .replace(/^\s*<!--[\s\S]*?-->\s*/g, "");
-}
-
-/** Full normalization pipeline: robust → plain embeddable <svg> */
-export function normalizeSvg(input: string): string {
-  if (!input) throw new Error("Empty SVG string.");
-  let s = input;
-
-  // Quick pass: if it doesn't look like SVG at all, bail
-  if (!looksLikeSvg(s)) {
-    throw new Error("API did not return recognizable SVG.");
   }
 
-  // 1) Strip XML header & leading comments
-  s = stripXmlPrologAndComments(s);
+  // Remove explicit width/height so CSS container controls size,
+  // and set a safe default style so it lays out nicely.
+  openSvg = openSvg
+    .replace(/\s+width\s*=\s*['"][^'"]*['"]/gi, "")
+    .replace(/\s+height\s*=\s*['"][^'"]*['"]/gi, "");
 
-  // 2) Remove namespace prefixes from tags/attrs, and xmlns:* declarations
-  s = stripNamespacePrefixes(s);
-
-  // 3) Ensure default xmlns on root <svg>
-  s = ensureDefaultXmlns(s);
-
-  // 4) Tidy dimensions to avoid layout explosions
-  s = capHugeDimensions(s, 6000);
-
-  // 5) Final small cleanup: collapse excessive whitespace between tags
-  s = s.replace(/>\s+</g, "><").trim();
-
-  // Final sanity: must start with <svg
-  if (!/^\s*<svg\b/i.test(s)) {
-    throw new Error("Normalized result is not embeddable SVG.");
+  if (!/\sstyle=/.test(openSvg)) {
+    openSvg = openSvg.replace(
+      /<\s*svg/i,
+      `<svg style="display:block;max-width:100%;height:auto"`
+    );
   }
+
+  // Rebuild the string with the cleaned <svg ...>
+  s = s.replace(/<\s*svg\b[^>]*>/i, openSvg);
+
+  // Strip any <script> blocks entirely for safety
+  s = s.replace(/<\s*script\b[\s\S]*?<\s*\/\s*script\s*>/gi, "");
 
   return s;
 }
