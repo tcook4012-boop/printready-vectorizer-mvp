@@ -7,9 +7,9 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
-  const [smoothness, setSmoothness] = useState<"low"|"medium"|"high">("medium");
+  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">("medium");
   const [minPathArea, setMinPathArea] = useState(0.0005);
-  const [order, setOrder] = useState<"light_to_dark"|"dark_to_light">("light_to_dark");
+  const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">("light_to_dark");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [svg, setSvg] = useState<string | null>(null);
@@ -21,8 +21,10 @@ export default function Home() {
       setError("Please upload an image");
       return;
     }
+
     try {
       setError(null);
+      setSvg(null);
       setLoading(true);
 
       const rawSvg = await vectorizeImage(file, {
@@ -30,17 +32,29 @@ export default function Home() {
         primitiveSnap,
         smoothness,
         minPathArea,
-        // @ts-ignore - order only used on backend; safe to include
         order,
       } as any);
 
       const cleaned = normalizeSvg(rawSvg);
+
+      // If backend returns non-SVG, surface it to UI
+      if (!cleaned || !cleaned.toLowerCase().includes("<svg")) {
+        console.warn("Non-SVG API response:", rawSvg?.slice(0, 500));
+        setError(
+          "API did not return embeddable SVG. First 300 chars:\n" +
+            String(rawSvg).slice(0, 300)
+        );
+        return;
+      }
+
       setSvg(cleaned);
     } catch (e: any) {
       const msg = String(e?.message || e);
-      setError(msg.includes("Failed to fetch")
-        ? "Could not reach the API. Check NEXT_PUBLIC_API_BASE."
-        : msg);
+      setError(
+        msg.includes("Failed to fetch")
+          ? "Could not reach API — check NEXT_PUBLIC_API_BASE."
+          : msg
+      );
     } finally {
       setLoading(false);
     }
@@ -80,7 +94,10 @@ export default function Home() {
 
       <div>
         <label>Smoothness: </label>
-        <select value={smoothness} onChange={(e) => setSmoothness(e.target.value as any)}>
+        <select
+          value={smoothness}
+          onChange={(e) => setSmoothness(e.target.value as any)}
+        >
           <option value="low">Low (faster, sharper)</option>
           <option value="medium">Medium</option>
           <option value="high">High (smoother curves)</option>
@@ -119,6 +136,7 @@ export default function Home() {
               (try 0.0002 – 0.001 to remove specks)
             </span>
           </div>
+
           <div style={{ marginTop: 8 }}>
             <label>Layer Order: </label>
             <select value={order} onChange={(e) => setOrder(e.target.value as any)}>
@@ -135,8 +153,14 @@ export default function Home() {
         </button>
       </div>
 
-      {error && <p style={{ color: "red" }}>{error}</p>}
+      {/* Show API errors */}
+      {error && (
+        <pre style={{ color: "red", whiteSpace: "pre-wrap", marginTop: 10 }}>
+          {error}
+        </pre>
+      )}
 
+      {/* SVG Output */}
       {svg && (
         <>
           <h3>Output:</h3>
