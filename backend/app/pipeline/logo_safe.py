@@ -89,7 +89,8 @@ def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.6))
+    # slightly stronger to smooth jagged small details (stars/diagonals)
+    im = im.filter(ImageFilter.GaussianBlur(radius=0.8))  # was 0.6
     return im
 
 def _reindex_to_palette(im: Image.Image, k: int) -> Image.Image:
@@ -100,19 +101,19 @@ def _get_darkest_palette_color(pal_img: Image.Image) -> Tuple[int, int, int]:
     """
     Find the darkest color (by luma) among used palette entries.
     """
-    # Ensure we have a P image with palette/usage info
     if pal_img.mode != "P":
-        # fallback: requantize (no dither) to at most 16
-        tmp = pal_img.quantize(colors=min(16, (pal_img.getcolors() or [None]*8).__len__()),
-                               method=Image.MEDIANCUT,
-                               dither=Image.Dither.NONE)
+        tmp = pal_img.quantize(
+            colors=min(16, (pal_img.getcolors() or [None] * 8).__len__()),
+            method=Image.MEDIANCUT,
+            dither=Image.Dither.NONE,
+        )
         pal_img = tmp
 
     pal = pal_img.getpalette()
     used = set([idx for _, idx in (pal_img.getcolors(maxcolors=256) or [])])
     darkest, min_y = (0, 0, 0), 1e9
     for idx in used:
-        r, g, b = pal[idx * 3: idx * 3 + 3]
+        r, g, b = pal[idx * 3 : idx * 3 + 3]
         y = 0.2126 * r + 0.7152 * g + 0.0722 * b
         if y < min_y:
             min_y = y
@@ -165,15 +166,11 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
-    im = _composite_over_white(im)     # kills alpha halos
-    im = _upsample_2x(im)              # more pixels → cleaner curves
+    im = _composite_over_white(im)      # kills alpha halos
+    im = _upsample_2x(im)               # more pixels → cleaner curves
 
-    # Optional very light unsharp to keep corners crisp
-    # blur = im.filter(ImageFilter.GaussianBlur(1.0))
-    # im = Image.blend(im, blur, -0.25)  # 1.25*im - 0.25*blur
-
-    # 1) Dehalo background (RGB dist ~7)
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=7 * 7)
+    # 1) Stronger dehalo (reduces light outlines around shapes)
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=9 * 9)  # was 7*7
 
     # 2) Auto K selection: rough heuristic from unique colors
     approx_unique = len(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or [])
@@ -207,21 +204,23 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # Slight tighten to avoid fattened outlines
+    # tighten a bit more so outlines don't bloat and halos don't leak
     mask = mask.filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MinFilter(3))  # extra erosion
 
-    # Potrace wants PBM (1-bit); Pillow writes correct PBM from mode "1"
+    # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
     stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
     os.close(stroke_svg_fd)
 
+    # Slightly smoother/cleaner curves without rounding letters too much
     potrace_cmd = [
         "potrace",
         pbm_path,
         "--svg",
         "--turdsize", "2",
-        "--alphamax", "1.4",         # lower → sharper corners; raise → smoother
-        "--opttolerance", "0.2",     # small → more points, crisper detail
+        "--alphamax", "1.2",      # was 1.4 → a bit crisper corners
+        "--opttolerance", "0.35", # was 0.2 → allow smoother fits where safe
         "--turnpolicy", "minority",
         "-o", stroke_svg_path,
     ]
@@ -236,9 +235,8 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     stroke_tree = ET.parse(stroke_svg_path)
     stroke_root = stroke_tree.getroot()
 
-    # Namespace handling (ET may include ns in tags)
     def _tag(t: str) -> str:
-        return t.split('}')[-1] if '}' in t else t
+        return t.split("}")[-1] if "}" in t else t
 
     # Create a stroke group with explicit stroke attributes (NO fill!)
     stroke_group = ET.Element(
@@ -255,7 +253,6 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
 
     for el in stroke_root.iter():
         if _tag(el.tag) == "path":
-            # ensure no fill leaks in from potrace
             el.attrib.pop("fill", None)
             el.set("stroke", stroke_color_hex)
             el.set("stroke-width", "2")
