@@ -1,128 +1,67 @@
 // frontend/lib/svg.ts
 
 /**
- * Step 1 — fast regex cleanup of namespaces/tiny issues.
- */
-function regexScrubNamespaces(s: string): string {
-  let t = s.trim();
-
-  // keep only outermost <svg>...</svg>
-  const open = t.search(/<\s*([a-zA-Z0-9:_-]+)\b[^>]*>/);
-  const close = t.search(/<\/\s*svg\s*>/i);
-  if (open === -1 || close === -1) return t; // fall through to XML path
-  t = t.slice(open, close + "</svg>".length);
-
-  // tags: <ns0:svg> -> <svg>, </ns0:svg> -> </svg>
-  t = t.replace(/<\s*[a-zA-Z_][\w.-]*:\s*svg\b/gi, "<svg");
-  t = t.replace(/<\/\s*[a-zA-Z_][\w.-]*:\s*svg\s*>/gi, "</svg>");
-
-  // any other namespaced tags: <nsX:foo ...> -> <foo ...>, </nsX:foo> -> </foo>
-  t = t.replace(/<\s*\/\s*([a-zA-Z_][\w.-]*):/g, "</");
-  t = t.replace(/<\s*([a-zA-Z_][\w.-]*):/g, "<");
-
-  // attributes: nsX:href="..." -> href="..."
-  t = t.replace(/\s([a-zA-Z_][\w.-]*):([a-zA-Z_][\w.-]*)=/g, " $2=");
-
-  // drop xmlns:* attributes; ensure base xmlns
-  t = t.replace(/\sxmlns:[a-zA-Z_][\w.-]*="[^"]*"/g, "");
-  if (!/\sxmlns\s*=/.test(t)) {
-    t = t.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
-  }
-
-  // inject viewBox if missing using width/height
-  if (!/\sviewBox\s*=\s*"/i.test(t)) {
-    const w = t.match(/\swidth\s*=\s*"([\d.]+)"/i);
-    const h = t.match(/\sheight\s*=\s*"([\d.]+)"/i);
-    if (w && h) {
-      t = t.replace(/<svg\b/i, `<svg viewBox="0 0 ${Number(w[1])} ${Number(h[1])}"`);
-    } else {
-      t = t.replace(/<svg\b/i, `<svg viewBox="0 0 1000 1000"`);
-    }
-  }
-
-  // remove fixed sizing so CSS can scale
-  t = t.replace(/\swidth\s*=\s*"[^"]*"/gi, "");
-  t = t.replace(/\sheight\s*=\s*"[^"]*"/gi, "");
-
-  // strip xml header/doctype
-  t = t.replace(/<\?xml[^>]*>/gi, "");
-  t = t.replace(/<!DOCTYPE[^>]*>/gi, "");
-
-  return t.trim();
-}
-
-/**
- * Step 2 — robust XML rebuild with namespaces stripped.
- * If regex left any prefix like "<ns0:svg" or attributes with "ns0:",
- * we parse and reconstruct a clean tree.
- */
-function xmlRebuildWithoutNamespaces(raw: string): string {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(raw, "image/svg+xml");
-  const root = doc.documentElement;
-  if (!root || root.nodeName.toLowerCase().includes("parsererror")) return "";
-
-  const SVG_NS = "http://www.w3.org/2000/svg";
-
-  function cloneSansNS(n: Element, parent: Element | null): Element {
-    // strip any prefix from tag name
-    const localName = n.localName || n.nodeName.replace(/^.*:/, "");
-    const el = doc.createElementNS(SVG_NS, localName);
-
-    // copy attributes without prefixes
-    for (const attr of Array.from(n.attributes)) {
-      const name = (attr.localName || attr.name.replace(/^.*:/, "")).toLowerCase();
-      if (name.startsWith("xmlns")) continue; // drop any xmlns / xmlns:*
-      el.setAttribute(name, attr.value);
-    }
-
-    // recurse children
-    for (const child of Array.from(n.childNodes)) {
-      if (child.nodeType === Node.ELEMENT_NODE) {
-        el.appendChild(cloneSansNS(child as Element, el));
-      } else {
-        el.appendChild(child.cloneNode(true));
-      }
-    }
-    return el;
-  }
-
-  const cleanSvg = cloneSansNS(root, null);
-
-  // ensure base xmlns + viewBox
-  cleanSvg.setAttribute("xmlns", SVG_NS);
-  if (!cleanSvg.getAttribute("viewBox")) {
-    const w = cleanSvg.getAttribute("width");
-    const h = cleanSvg.getAttribute("height");
-    if (w && h) {
-      cleanSvg.setAttribute("viewBox", `0 0 ${Number(w)} ${Number(h)}`);
-    } else {
-      cleanSvg.setAttribute("viewBox", "0 0 1000 1000");
-    }
-  }
-  // drop fixed sizing so container controls size
-  cleanSvg.removeAttribute("width");
-  cleanSvg.removeAttribute("height");
-
-  const ser = new XMLSerializer();
-  return ser.serializeToString(cleanSvg);
-}
-
-/**
- * Public API: normalize raw server response into an embeddable <svg>.
- * 1) fast regex scrub; 2) if still namespaced, XML rebuild.
+ * Make an arbitrary SVG string safe to inline in HTML:
+ *  - strip xml/doctype
+ *  - drop namespace prefixes (e.g. ns0:svg -> svg)
+ *  - ensure xmlns + viewBox
+ *  - remove fixed width/height and set 100%/100%
+ *  - keep large shapes but drop a single full-canvas white backdrop path
  */
 export function normalizeSvg(raw: string): string {
   if (!raw) return "";
-  if (raw.trim().startsWith("{") || raw.trim().startsWith("[")) return ""; // looks like JSON error
-  let s = regexScrubNamespaces(raw);
 
-  // If any namespaced tag remains, rebuild via XML
-  if (/(^|<)\/?\s*[a-zA-Z_][\w.-]*:/.test(s) || /^<ns\d*:svg/i.test(raw.trim())) {
-    const rebuilt = xmlRebuildWithoutNamespaces(raw);
-    if (rebuilt) s = rebuilt;
+  let s = String(raw).trim();
+
+  // 1) Strip XML prolog + DOCTYPE
+  s = s.replace(/<\?xml[^>]*>/i, "");
+  s = s.replace(/<!DOCTYPE[^>]*>/i, "");
+
+  // 2) Convert ns:svg to svg and remove tag prefixes everywhere
+  s = s
+    .replace(/<\s*([a-z0-9]+:)?svg\b/gi, "<svg")
+    .replace(/<\/\s*([a-z0-9]+:)?svg\s*>/gi, "</svg>")
+    .replace(/<\s*([a-z0-9]+:)(\w+)/gi, "<$2")
+    .replace(/<\/\s*([a-z0-9]+:)(\w+)\s*>/gi, "</$2>");
+
+  // 3) Remove xmlns:* attrs but ensure base xmlns
+  s = s.replace(/\sxmlns:[a-zA-Z0-9]+\s*=\s*"[^"]*"/g, "");
+  if (!/xmlns=/.test(s)) {
+    s = s.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
   }
 
-  // final sanity
-  return /<svg\b/i.test(s) ? s : "";
+  // 4) Guarantee viewBox; derive from numeric width/height if needed
+  const wh = /<svg[^>]*\bwidth\s*=\s*["']?(\d+(?:\.\d+)?)(?:px)?["'][^>]*\bheight\s*=\s*["']?(\d+(?:\.\d+)?)(?:px)?["']/i.exec(
+    s
+  );
+  const hasViewBox = /<svg[^>]*\bviewBox\s*=\s*["'][^"']+["']/i.test(s);
+  if (wh && !hasViewBox) {
+    const w = Number(wh[1]);
+    const h = Number(wh[2]);
+    s = s.replace(/<svg\b/i, `<svg viewBox="0 0 ${w || 100} ${h || 100}"`);
+  }
+
+  // 5) Remove fixed width/height; scale to container
+  s = s.replace(/<svg\b([^>]*)>/i, (_m, attrs) => {
+    let a = attrs
+      .replace(/\bwidth\s*=\s*["'][^"']*["']/gi, "")
+      .replace(/\bheight\s*=\s*["'][^"']*["']/gi, "")
+      .replace(/\s+/g, " ");
+    return `<svg${a} width="100%" height="100%" preserveAspectRatio="xMidYMid meet">`;
+  });
+
+  // 6) If the very first path is a giant white backdrop, drop it (prevents “white sheet covering everything”)
+  // We only remove a fully closed <path> whose fill is an almost-white (#fff, #fefefe, #feffff) and that appears
+  // before any other visible shapes.
+  s = s.replace(
+    /<path[^>]*\bfill\s*=\s*"(?:#fff(?:fff)?|#fefefe|#feffff)"[^>]*>\s*<\/path>\s*/i,
+    ""
+  );
+
+  return s;
+}
+
+/** Useful when you want to preview via <img src=...> instead of inline innerHTML. */
+export function dataUrlForSvg(svg: string): string {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
