@@ -1,5 +1,6 @@
+// frontend/app/page.tsx
 "use client";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { vectorizeImage } from "../lib/api";
 import { normalizeSvg } from "../lib/svg";
 
@@ -7,32 +8,28 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [maxColors, setMaxColors] = useState(4);
   const [primitiveSnap, setPrimitiveSnap] = useState(false);
-  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">(
-    "medium"
-  );
+  const [smoothness, setSmoothness] = useState<"low" | "medium" | "high">("medium");
   const [minPathArea, setMinPathArea] = useState(0.0005);
-  const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">(
-    "light_to_dark"
-  );
+  const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">("light_to_dark");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [svg, setSvg] = useState<string | null>(null);
+  const [raw, setRaw] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Preview helpers
-  const [zoom, setZoom] = useState<number>(100); // %
-  const zoomScale = useMemo(() => Math.max(0.25, Math.min(2, zoom / 100)), [zoom]);
+  const [zoom, setZoom] = useState(0.75);
+  const viewportRef = useRef<HTMLDivElement>(null);
 
   const handleVectorize = async () => {
     if (!file) {
       setError("Please upload an image");
       return;
     }
-
     try {
       setError(null);
       setSvg(null);
+      setRaw(null);
       setLoading(true);
 
       const rawSvg = await vectorizeImage(file, {
@@ -43,20 +40,17 @@ export default function Home() {
         order,
       } as any);
 
-      const cleaned = normalizeSvg(rawSvg);
+      setRaw(typeof rawSvg === "string" ? rawSvg : JSON.stringify(rawSvg));
 
+      const cleaned = normalizeSvg(String(rawSvg || ""));
       if (!cleaned || !cleaned.toLowerCase().includes("<svg")) {
-        console.warn("Non-SVG API response:", String(rawSvg)?.slice(0, 500));
         setError(
-          "API did not return embeddable SVG. First 300 chars:\n" +
-            String(rawSvg).slice(0, 300)
+          "API returned data but it wasn't a usable <svg>. First 300 chars:\n" +
+          String(rawSvg).slice(0, 300)
         );
         return;
       }
-
       setSvg(cleaned);
-      // try to start preview fit-ish
-      setZoom(100);
     } catch (e: any) {
       const msg = String(e?.message || e);
       setError(
@@ -80,8 +74,22 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
+  const scaledStyle = useMemo(
+    () => ({
+      transform: `scale(${zoom})`,
+      transformOrigin: "top left",
+      display: "inline-block",
+    }),
+    [zoom]
+  );
+
+  const fitIsh = () => {
+    // crude “fit” so the svg usually fits once
+    setZoom(0.8);
+  };
+
   return (
-    <main style={{ padding: 20, maxWidth: 1100, margin: "0 auto" }}>
+    <main style={{ padding: 20, maxWidth: 980, margin: "0 auto" }}>
       <h1>PrintReady Vectorizer</h1>
 
       <input
@@ -148,10 +156,7 @@ export default function Home() {
 
           <div style={{ marginTop: 8 }}>
             <label>Layer Order: </label>
-            <select
-              value={order}
-              onChange={(e) => setOrder(e.target.value as any)}
-            >
+            <select value={order} onChange={(e) => setOrder(e.target.value as any)}>
               <option value="light_to_dark">Light → Dark</option>
               <option value="dark_to_light">Dark → Light</option>
             </select>
@@ -165,64 +170,68 @@ export default function Home() {
         </button>
       </div>
 
-      {/* Show API errors */}
       {error && (
         <pre style={{ color: "red", whiteSpace: "pre-wrap", marginTop: 10 }}>
           {error}
         </pre>
       )}
 
-      {/* SVG Output */}
-      {svg && (
-        <>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 18 }}>
-            <h3 style={{ margin: 0 }}>Output:</h3>
-            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              Zoom:
-              <input
-                type="range"
-                min={25}
-                max={200}
-                step={5}
-                value={zoom}
-                onChange={(e) => setZoom(Number(e.target.value))}
-              />
-              <span style={{ width: 48, textAlign: "right" }}>{zoom}%</span>
-            </label>
-            <button onClick={() => setZoom(100)}>100%</button>
-            <button onClick={() => setZoom(200)}>200%</button>
-            <button onClick={() => setZoom(75)}>Fit-ish</button>
-          </div>
+      <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 8 }}>
+        <strong>Output:</strong>
+        <span>Zoom:&nbsp;</span>
+        <input
+          type="range"
+          min={0.25}
+          max={4}
+          step={0.05}
+          value={zoom}
+          onChange={(e) => setZoom(Number(e.target.value))}
+          style={{ width: 200 }}
+        />
+        <button onClick={() => setZoom(0.75)}>75%</button>
+        <button onClick={() => setZoom(1)}>100%</button>
+        <button onClick={() => setZoom(2)}>200%</button>
+        <button onClick={fitIsh}>Fit-ish</button>
+      </div>
 
-          {/* Scrollable preview area */}
+      <div
+        ref={viewportRef}
+        style={{
+          border: "1px solid #999",
+          width: "100%",
+          height: 520,
+          overflow: "auto",          // <— scrollbars always available
+          background: "#fff",
+          marginTop: 8,
+          position: "relative",
+        }}
+      >
+        {/* Render normalized SVG (if any). We deliberately use innerHTML so the SVG is interactive */}
+        {svg ? (
           <div
-            style={{
-              border: "1px solid #999",
-              maxWidth: "100%",
-              height: "70vh",
-              overflow: "auto",             // <-- scrollbars appear as needed
-              background: "#fff",
-              marginTop: 8,
-              padding: 12,
-            }}
-          >
-            {/* scale the SVG inside, but keep natural size so scrollbars work */}
-            <div
-              style={{
-                transform: `scale(${zoomScale})`,
-                transformOrigin: "top left",
-                width: "max-content",       // allows scroll of scaled content
-                height: "max-content",
-              }}
-              // NOTE: we purposely render the raw SVG markup
-              dangerouslySetInnerHTML={{ __html: svg }}
-            />
+            style={scaledStyle}
+            // eslint-disable-next-line react/no-danger
+            dangerouslySetInnerHTML={{ __html: svg }}
+          />
+        ) : (
+          <div style={{ color: "#888", padding: 12 }}>
+            {loading ? "Rendering..." : "No output yet."}
           </div>
+        )}
+      </div>
 
-          <button onClick={downloadSvg} style={{ marginTop: 10 }}>
-            Download SVG
-          </button>
-        </>
+      {svg && (
+        <button onClick={downloadSvg} style={{ marginTop: 10 }}>
+          Download SVG
+        </button>
+      )}
+
+      {/* Optional: tiny debug peek at the first part of raw response */}
+      {raw && !svg && (
+        <details style={{ marginTop: 10 }}>
+          <summary>Debug: Raw API response (first 400 chars)</summary>
+          <pre style={{ whiteSpace: "pre-wrap" }}>{String(raw).slice(0, 400)}</pre>
+        </details>
       )}
     </main>
   );
