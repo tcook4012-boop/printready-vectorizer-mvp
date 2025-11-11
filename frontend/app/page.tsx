@@ -1,8 +1,8 @@
 // frontend/app/page.tsx
 "use client";
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { vectorizeImage } from "../lib/api";
-import { normalizeSvg } from "../lib/svg";
+import { normalizeSvg, dataUrlForSvg } from "../lib/svg";
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -12,15 +12,16 @@ export default function Home() {
   const [minPathArea, setMinPathArea] = useState(0.0005);
   const [order, setOrder] = useState<"light_to_dark" | "dark_to_light">("light_to_dark");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [bypassNormalizer, setBypassNormalizer] = useState(false);
 
   const [svg, setSvg] = useState<string | null>(null);
   const [raw, setRaw] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [useRawSvg, setUseRawSvg] = useState(false); // NEW: bypass normalizer (debug)
 
   const [zoom, setZoom] = useState(0.75);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const [renderAsImg, setRenderAsImg] = useState(false); // auto-fallback
 
   const handleVectorize = async () => {
     if (!file) {
@@ -31,6 +32,7 @@ export default function Home() {
       setError(null);
       setSvg(null);
       setRaw(null);
+      setRenderAsImg(false);
       setLoading(true);
 
       const rawSvg = await vectorizeImage(file, {
@@ -44,12 +46,13 @@ export default function Home() {
       const rawStr = typeof rawSvg === "string" ? rawSvg : JSON.stringify(rawSvg);
       setRaw(rawStr);
 
-      // If user toggles "Bypass normalizer", try to render raw unmodified.
-      const candidate = useRawSvg ? rawStr : normalizeSvg(String(rawStr || ""));
-      if (!candidate || !/<svg\b/i.test(candidate)) {
+      const candidate = bypassNormalizer ? rawStr : normalizeSvg(rawStr);
+
+      // guard: require a bare <svg ...> (no ns0:svg)
+      if (!/<svg[\s>]/i.test(candidate)) {
         setError(
           "API returned data but it wasn't a usable <svg>. First 300 chars:\n" +
-          String(rawStr).slice(0, 300)
+            String(rawStr).slice(0, 300)
         );
         return;
       }
@@ -65,6 +68,25 @@ export default function Home() {
       setLoading(false);
     }
   };
+
+  // After we inject the SVG, if the browser reports a zero-size bbox, switch to <img src="data:...">
+  useEffect(() => {
+    if (!svg || !viewportRef.current) return;
+    const el = viewportRef.current.querySelector("svg") as SVGSVGElement | null;
+    if (!el) return;
+
+    try {
+      const box = el.getBBox();
+      if (!box || box.width === 0 || box.height === 0) {
+        setRenderAsImg(true);
+      } else {
+        setRenderAsImg(false);
+      }
+    } catch {
+      // Some SVGs throw in getBBox if not yet laid out; fall back conservatively
+      setRenderAsImg(true);
+    }
+  }, [svg]);
 
   const downloadSvg = () => {
     if (!svg) return;
@@ -127,19 +149,19 @@ export default function Home() {
             type="checkbox"
             checked={primitiveSnap}
             onChange={(e) => setPrimitiveSnap(e.target.checked)}
-          />
-          {" "}Primitive Snap
+          />{" "}
+          Primitive Snap
         </label>
       </div>
 
-      <div style={{ marginTop: 8 }}>
+      <div>
         <label>
           <input
             type="checkbox"
-            checked={useRawSvg}
-            onChange={(e) => setUseRawSvg(e.target.checked)}
-          />
-          {" "}Bypass normalizer (debug)
+            checked={bypassNormalizer}
+            onChange={(e) => setBypassNormalizer(e.target.checked)}
+          />{" "}
+          Bypass normalizer (debug)
         </label>
       </div>
 
@@ -218,11 +240,19 @@ export default function Home() {
         }}
       >
         {svg ? (
-          <div
-            style={scaledStyle}
-            // eslint-disable-next-line react/no-danger
-            dangerouslySetInnerHTML={{ __html: svg }}
-          />
+          renderAsImg ? (
+            <img
+              alt="vectorized preview"
+              src={dataUrlForSvg(svg)}
+              style={{ ...scaledStyle, display: "block" }}
+            />
+          ) : (
+            <div
+              style={scaledStyle}
+              // eslint-disable-next-line react/no-danger
+              dangerouslySetInnerHTML={{ __html: svg }}
+            />
+          )
         ) : (
           <div style={{ color: "#888", padding: 12 }}>
             {loading ? "Rendering..." : "No output yet."}
