@@ -48,10 +48,10 @@ def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     """Fast RGB squared distance."""
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
-def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 7 * 7):
+def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 8 * 8):
     """
     Replace pixels close to the background with pure white, then grow by ~2px.
-    Simple/fast RGB distance; avoids pulling in heavy deps.
+    Slightly stronger threshold (8^2) to better remove colored fringing.
     """
     im = im.copy()
     w, h = im.size
@@ -72,6 +72,9 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 7 * 7):
     # set to white where mask = 255
     white = Image.new("RGB", im.size, (255, 255, 255))
     im.paste(white, mask=mask)
+
+    # tiny post-dehalo blur to smooth residual halo edges
+    im = im.filter(ImageFilter.GaussianBlur(radius=0.35))
     return im
 
 def _upsample_2x(im: Image.Image) -> Image.Image:
@@ -89,8 +92,7 @@ def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    # slightly stronger to smooth jagged small details (stars/diagonals)
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.8))  # was 0.6
+    im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
     return im
 
 def _reindex_to_palette(im: Image.Image, k: int) -> Image.Image:
@@ -169,8 +171,8 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     im = _composite_over_white(im)      # kills alpha halos
     im = _upsample_2x(im)               # more pixels → cleaner curves
 
-    # 1) Stronger dehalo (reduces light outlines around shapes)
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=9 * 9)  # was 7*7
+    # 1) Stronger dehalo (reduces light outlines around shapes) + tiny smoothing
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=8 * 8)
 
     # 2) Auto K selection: rough heuristic from unique colors
     approx_unique = len(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or [])
@@ -204,23 +206,23 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # tighten a bit more so outlines don't bloat and halos don't leak
+    # tighten then close tiny notches → crisper star points, less bloat
     mask = mask.filter(ImageFilter.MinFilter(3))
-    mask = mask.filter(ImageFilter.MinFilter(3))  # extra erosion
+    mask = mask.filter(ImageFilter.MaxFilter(3))
 
     # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
     stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
     os.close(stroke_svg_fd)
 
-    # Slightly smoother/cleaner curves without rounding letters too much
+    # Sharper corners / small text; adjust if too noisy
     potrace_cmd = [
         "potrace",
         pbm_path,
         "--svg",
         "--turdsize", "2",
-        "--alphamax", "1.2",      # was 1.4 → a bit crisper corners
-        "--opttolerance", "0.35", # was 0.2 → allow smoother fits where safe
+        "--alphamax", "1.0",
+        "--opttolerance", "0.10",
         "--turnpolicy", "minority",
         "-o", stroke_svg_path,
     ]
