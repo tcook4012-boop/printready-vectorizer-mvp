@@ -48,10 +48,25 @@ def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     """Fast RGB squared distance."""
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
-def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 8 * 8):
+def _white_sweep(im: Image.Image, thresh: int = 248) -> Image.Image:
+    """
+    Push very-near-white pixels to pure white. Helps remove faint halos
+    left over after compositing + dehalo.
+    """
+    im = im.convert("RGB")
+    px = im.load()
+    w, h = im.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if r >= thresh and g >= thresh and b >= thresh:
+                px[x, y] = (255, 255, 255)
+    return im
+
+def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 10 * 10):
     """
     Replace pixels close to the background with pure white, then grow by ~2px.
-    Slightly stronger threshold (8^2) to better remove colored fringing.
+    Using slightly stronger default than before to shrink hazy borders.
     """
     im = im.copy()
     w, h = im.size
@@ -67,42 +82,45 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 8 * 8):
             if _color_dist(p, bg) <= dist_thresh_sq:
                 mp[x, y] = 255
 
-    # grow mask ~2px
+    # Grow mask ~2px and apply
     mask = mask.filter(ImageFilter.MaxFilter(size=5))
-    # set to white where mask = 255
     white = Image.new("RGB", im.size, (255, 255, 255))
     im.paste(white, mask=mask)
-
-    # tiny post-dehalo blur to smooth residual halo edges
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.35))
     return im
 
-def _upsample_2x(im: Image.Image) -> Image.Image:
-    return im.resize((im.width * 2, im.height * 2), Image.Resampling.LANCZOS)
+def _upsample(im: Image.Image, factor: int = 3) -> Image.Image:
+    """Higher upsample → cleaner curves and crisper small shapes (stars, serifs)."""
+    return im.resize((im.width * factor, im.height * factor), Image.Resampling.LANCZOS)
 
 def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
     """Median cut to k colors, no dithering."""
     q = im.quantize(colors=k, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
     return q.convert("RGB")
 
-def _gentle_regularize(im: Image.Image) -> Image.Image:
+def _gentle_regularize(im: Image.Image, blur_radius: float = 0.6) -> Image.Image:
     """
     Light morphological clean-up:
     Min -> Max (size=3) to close tiny gaps, then small blur to smooth edges.
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
+    im = im.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     return im
+
+def _light_unsharp(im: Image.Image, radius: float = 1.2, amount: float = 0.25) -> Image.Image:
+    """
+    A very light unsharp mask: im + amount*(im - blur). Negative blend keeps it simple with PIL.
+    """
+    blur = im.filter(ImageFilter.GaussianBlur(radius))
+    # 1.0*im - amount*blur  (implemented via blend with negative alpha)
+    return Image.blend(im, blur, -amount)
 
 def _reindex_to_palette(im: Image.Image, k: int) -> Image.Image:
     """Snap smoothed image back to an exact K-color palette."""
     return _quantize_no_dither(im, k)
 
 def _get_darkest_palette_color(pal_img: Image.Image) -> Tuple[int, int, int]:
-    """
-    Find the darkest color (by luma) among used palette entries.
-    """
+    """Find the darkest color (by luma) among used palette entries."""
     if pal_img.mode != "P":
         tmp = pal_img.quantize(
             colors=min(16, (pal_img.getcolors() or [None] * 8).__len__()),
@@ -153,6 +171,28 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
     out, err = proc.communicate(input=input_bytes)
     return proc.returncode, out, err
 
+# ---- SVG post-process: hide antialias seams between adjacent fills ----
+def _apply_fill_stroke_hack(svg_root: ET.Element, stroke_width: str = "0.3"):
+    """
+    Adds a tiny stroke matching each path's fill and sets crisp rendering hints.
+    This mitigates hairline seams some viewers show between touching paths.
+    """
+    # root rendering hints
+    style_root = svg_root.get("style", "")
+    extra = "shape-rendering:crispEdges;paint-order:stroke fill;vector-effect:non-scaling-stroke;"
+    svg_root.set("style", (style_root + ";" + extra).strip(";"))
+
+    def tag_name(t: str) -> str:
+        return t.split("}")[-1] if "}" in t else t
+
+    for el in svg_root.iter():
+        if tag_name(el.tag) == "path":
+            fill = el.get("fill")
+            if fill and fill.lower() != "none":
+                el.set("stroke", fill)
+                el.set("stroke-width", stroke_width)
+                # round joins help hide micro-gaps
+                el.set("stroke-linejoin", "round")
 
 # =========================
 # Main pipeline
@@ -168,11 +208,15 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
-    im = _composite_over_white(im)      # kills alpha halos
-    im = _upsample_2x(im)               # more pixels → cleaner curves
+    im = _composite_over_white(im)          # kills alpha halos
+    im = _white_sweep(im, thresh=248)       # push near-white to white
+    im = _upsample(im, factor=3)            # more pixels → cleaner curves
 
-    # 1) Stronger dehalo (reduces light outlines around shapes) + tiny smoothing
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=8 * 8)
+    # (Optional) a touch of unsharp for tiny details like stars
+    im = _light_unsharp(im, radius=1.0, amount=0.18)
+
+    # 1) Dehalo background (a bit stronger)
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=10 * 10)
 
     # 2) Auto K selection: rough heuristic from unique colors
     approx_unique = len(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or [])
@@ -187,16 +231,15 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     im_q = _quantize_no_dither(im, k)
 
     # 4) Gentle regularization and snap-to-palette
-    im_smooth = _gentle_regularize(im_q)
+    im_smooth = _gentle_regularize(im_q, blur_radius=0.55)  # slightly tighter than before
     im_final = _reindex_to_palette(im_smooth, k)
 
     # 5) Two-pass vectorization
 
-    # 5A) Fills with VTracer
+    # 5A) Fills with VTracer (defaults are okay for v0.6.x)
     png_path = _write_temp_image(im_final, ".png")
     fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg")
     os.close(fills_svg_fd)
-
     rc, _, err = _run(["vtracer", "-i", png_path, "-o", fills_svg_path])
     if rc != 0:
         raise RuntimeError(f"vtracer failed: {err.decode('utf-8', 'ignore')}")
@@ -206,23 +249,22 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # tighten then close tiny notches → crisper star points, less bloat
+    # tighten so outlines don't bloat or leak halo color
     mask = mask.filter(ImageFilter.MinFilter(3))
-    mask = mask.filter(ImageFilter.MaxFilter(3))
+    mask = mask.filter(ImageFilter.MinFilter(3))  # extra erosion
 
-    # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
     stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
     os.close(stroke_svg_fd)
 
-    # Sharper corners / small text; adjust if too noisy
+    # A bit crisper corners, but still smooth; higher turdsize removes stray lines/specks
     potrace_cmd = [
         "potrace",
         pbm_path,
         "--svg",
-        "--turdsize", "2",
-        "--alphamax", "1.0",
-        "--opttolerance", "0.10",
+        "--turdsize", "3",          # ↑ from 2 → fewer tiny artifacts
+        "--alphamax", "1.08",       # ↓ from 1.2–1.4 → sharper corners
+        "--opttolerance", "0.30",   # moderate fit quality
         "--turnpolicy", "minority",
         "-o", stroke_svg_path,
     ]
@@ -240,6 +282,9 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     def _tag(t: str) -> str:
         return t.split("}")[-1] if "}" in t else t
 
+    # Fill seam fix: tiny same-color stroke on all fill paths
+    _apply_fill_stroke_hack(fills_root, stroke_width="0.3")
+
     # Create a stroke group with explicit stroke attributes (NO fill!)
     stroke_group = ET.Element(
         "g",
@@ -250,9 +295,9 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
             "stroke-width": "2",
             "stroke-linejoin": "round",
             "stroke-linecap": "round",
+            "vector-effect": "non-scaling-stroke",
         },
     )
-
     for el in stroke_root.iter():
         if _tag(el.tag) == "path":
             el.attrib.pop("fill", None)
