@@ -17,6 +17,7 @@ export default function Home() {
   const [raw, setRaw] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [useRawSvg, setUseRawSvg] = useState(false); // NEW: bypass normalizer (debug)
 
   const [zoom, setZoom] = useState(0.75);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -40,17 +41,19 @@ export default function Home() {
         order,
       } as any);
 
-      setRaw(typeof rawSvg === "string" ? rawSvg : JSON.stringify(rawSvg));
+      const rawStr = typeof rawSvg === "string" ? rawSvg : JSON.stringify(rawSvg);
+      setRaw(rawStr);
 
-      const cleaned = normalizeSvg(String(rawSvg || ""));
-      if (!cleaned || !cleaned.toLowerCase().includes("<svg")) {
+      // If user toggles "Bypass normalizer", try to render raw unmodified.
+      const candidate = useRawSvg ? rawStr : normalizeSvg(String(rawStr || ""));
+      if (!candidate || !/<svg\b/i.test(candidate)) {
         setError(
           "API returned data but it wasn't a usable <svg>. First 300 chars:\n" +
-          String(rawSvg).slice(0, 300)
+          String(rawStr).slice(0, 300)
         );
         return;
       }
-      setSvg(cleaned);
+      setSvg(candidate);
     } catch (e: any) {
       const msg = String(e?.message || e);
       setError(
@@ -83,10 +86,7 @@ export default function Home() {
     [zoom]
   );
 
-  const fitIsh = () => {
-    // crude “fit” so the svg usually fits once
-    setZoom(0.8);
-  };
+  const fitIsh = () => setZoom(0.8);
 
   return (
     <main style={{ padding: 20, maxWidth: 980, margin: "0 auto" }}>
@@ -129,6 +129,17 @@ export default function Home() {
             onChange={(e) => setPrimitiveSnap(e.target.checked)}
           />
           {" "}Primitive Snap
+        </label>
+      </div>
+
+      <div style={{ marginTop: 8 }}>
+        <label>
+          <input
+            type="checkbox"
+            checked={useRawSvg}
+            onChange={(e) => setUseRawSvg(e.target.checked)}
+          />
+          {" "}Bypass normalizer (debug)
         </label>
       </div>
 
@@ -200,13 +211,12 @@ export default function Home() {
           border: "1px solid #999",
           width: "100%",
           height: 520,
-          overflow: "auto",          // <— scrollbars always available
+          overflow: "auto",
           background: "#fff",
           marginTop: 8,
           position: "relative",
         }}
       >
-        {/* Render normalized SVG (if any). We deliberately use innerHTML so the SVG is interactive */}
         {svg ? (
           <div
             style={scaledStyle}
@@ -226,7 +236,6 @@ export default function Home() {
         </button>
       )}
 
-      {/* Optional: tiny debug peek at the first part of raw response */}
       {raw && !svg && (
         <details style={{ marginTop: 10 }}>
           <summary>Debug: Raw API response (first 400 chars)</summary>
