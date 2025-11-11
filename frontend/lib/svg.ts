@@ -1,75 +1,128 @@
 // frontend/lib/svg.ts
 
 /**
- * Aggressively normalize possibly-namespaced SVG strings so they can be
- * injected with dangerouslySetInnerHTML and scaled by CSS.
+ * Step 1 — fast regex cleanup of namespaces/tiny issues.
  */
-export function normalizeSvg(raw: string): string {
-  if (!raw) return "";
+function regexScrubNamespaces(s: string): string {
+  let t = s.trim();
 
-  let s = String(raw).trim();
+  // keep only outermost <svg>...</svg>
+  const open = t.search(/<\s*([a-zA-Z0-9:_-]+)\b[^>]*>/);
+  const close = t.search(/<\/\s*svg\s*>/i);
+  if (open === -1 || close === -1) return t; // fall through to XML path
+  t = t.slice(open, close + "</svg>".length);
 
-  // Bail if it looks like JSON (API error body etc.)
-  if (s.startsWith("{") || s.startsWith("[")) return "";
+  // tags: <ns0:svg> -> <svg>, </ns0:svg> -> </svg>
+  t = t.replace(/<\s*[a-zA-Z_][\w.-]*:\s*svg\b/gi, "<svg");
+  t = t.replace(/<\/\s*[a-zA-Z_][\w.-]*:\s*svg\s*>/gi, "</svg>");
 
-  // Keep only the outermost <svg ...>...</svg>
-  const firstSvgOpen = s.search(/<\s*([a-zA-Z0-9:_-]+)\b[^>]*>/);
-  const lastSvgClose = s.search(/<\/\s*svg\s*>/i);
-  if (firstSvgOpen === -1 || lastSvgClose === -1) return "";
-  s = s.slice(firstSvgOpen, lastSvgClose + "</svg>".length);
+  // any other namespaced tags: <nsX:foo ...> -> <foo ...>, </nsX:foo> -> </foo>
+  t = t.replace(/<\s*\/\s*([a-zA-Z_][\w.-]*):/g, "</");
+  t = t.replace(/<\s*([a-zA-Z_][\w.-]*):/g, "<");
 
-  // --- Namespace removal (tags) ---
-  // <ns0:svg> -> <svg>  and </ns0:svg> -> </svg>
-  s = s.replace(/<\s*[a-zA-Z_][\w.-]*:\s*svg\b/gi, "<svg");
-  s = s.replace(/<\/\s*[a-zA-Z_][\w.-]*:\s*svg\s*>/gi, "</svg>");
+  // attributes: nsX:href="..." -> href="..."
+  t = t.replace(/\s([a-zA-Z_][\w.-]*):([a-zA-Z_][\w.-]*)=/g, " $2=");
 
-  // Any other namespaced elements: <nsX:anything ...> -> <anything ...>
-  // Closing tags:
-  s = s.replace(/<\s*\/\s*([a-zA-Z_][\w.-]*):/g, "</");
-  // Opening/self-closing tags:
-  s = s.replace(/<\s*([a-zA-Z_][\w.-]*):/g, "<");
-
-  // --- Namespace removal (attributes) ---
-  // nsX:href="..." -> href="..."
-  s = s.replace(/\s([a-zA-Z_][\w.-]*):([a-zA-Z_][\w.-]*)=/g, " $2=");
-
-  // Drop explicit xmlns:* attributes; keep/add base xmlns
-  s = s.replace(/\sxmlns:[a-zA-Z_][\w.-]*="[^"]*"/g, "");
-  if (!/\sxmlns\s*=/.test(s)) {
-    s = s.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  // drop xmlns:* attributes; ensure base xmlns
+  t = t.replace(/\sxmlns:[a-zA-Z_][\w.-]*="[^"]*"/g, "");
+  if (!/\sxmlns\s*=/.test(t)) {
+    t = t.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
   }
 
-  // Ensure we have a viewBox; derive from numeric width/height if present
-  const hasViewBox = /\sviewBox\s*=\s*"/i.test(s);
-  const wMatch = s.match(/\swidth\s*=\s*"([\d.]+)"/i);
-  const hMatch = s.match(/\sheight\s*=\s*"([\d.]+)"/i);
-  if (!hasViewBox) {
-    const w = wMatch ? Number(wMatch[1]) : undefined;
-    const h = hMatch ? Number(hMatch[1]) : undefined;
-    if (Number.isFinite(w) && Number.isFinite(h) && w! > 0 && h! > 0) {
-      s = s.replace(/<svg\b/i, `<svg viewBox="0 0 ${w} ${h}"`);
+  // inject viewBox if missing using width/height
+  if (!/\sviewBox\s*=\s*"/i.test(t)) {
+    const w = t.match(/\swidth\s*=\s*"([\d.]+)"/i);
+    const h = t.match(/\sheight\s*=\s*"([\d.]+)"/i);
+    if (w && h) {
+      t = t.replace(/<svg\b/i, `<svg viewBox="0 0 ${Number(w[1])} ${Number(h[1])}"`);
     } else {
-      s = s.replace(/<svg\b/i, `<svg viewBox="0 0 1000 1000"`);
+      t = t.replace(/<svg\b/i, `<svg viewBox="0 0 1000 1000"`);
     }
   }
 
-  // Remove fixed width/height so the preview container can size it
-  s = s.replace(/\swidth\s*=\s*"[^"]*"/gi, "");
-  s = s.replace(/\sheight\s*=\s*"[^"]*"/gi, "");
+  // remove fixed sizing so CSS can scale
+  t = t.replace(/\swidth\s*=\s*"[^"]*"/gi, "");
+  t = t.replace(/\sheight\s*=\s*"[^"]*"/gi, "");
 
-  // Strip XML header/doctype if present
-  s = s.replace(/<\?xml[^>]*>/gi, "");
-  s = s.replace(/<!DOCTYPE[^>]*>/gi, "");
+  // strip xml header/doctype
+  t = t.replace(/<\?xml[^>]*>/gi, "");
+  t = t.replace(/<!DOCTYPE[^>]*>/gi, "");
 
-  return s.trim();
+  return t.trim();
 }
 
 /**
- * Optional wrapper if you later need a zoom group.
+ * Step 2 — robust XML rebuild with namespaces stripped.
+ * If regex left any prefix like "<ns0:svg" or attributes with "ns0:",
+ * we parse and reconstruct a clean tree.
  */
-export function wrapForPreview(svg: string): string {
-  if (!svg) return "";
-  return svg
-    .replace(/<svg\b([^>]*)>/i, (_m, attrs) => `<svg ${attrs}><g id="preview-root">`)
-    .replace(/<\/svg>\s*$/i, "</g></svg>");
+function xmlRebuildWithoutNamespaces(raw: string): string {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(raw, "image/svg+xml");
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase().includes("parsererror")) return "";
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+
+  function cloneSansNS(n: Element, parent: Element | null): Element {
+    // strip any prefix from tag name
+    const localName = n.localName || n.nodeName.replace(/^.*:/, "");
+    const el = doc.createElementNS(SVG_NS, localName);
+
+    // copy attributes without prefixes
+    for (const attr of Array.from(n.attributes)) {
+      const name = (attr.localName || attr.name.replace(/^.*:/, "")).toLowerCase();
+      if (name.startsWith("xmlns")) continue; // drop any xmlns / xmlns:*
+      el.setAttribute(name, attr.value);
+    }
+
+    // recurse children
+    for (const child of Array.from(n.childNodes)) {
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        el.appendChild(cloneSansNS(child as Element, el));
+      } else {
+        el.appendChild(child.cloneNode(true));
+      }
+    }
+    return el;
+  }
+
+  const cleanSvg = cloneSansNS(root, null);
+
+  // ensure base xmlns + viewBox
+  cleanSvg.setAttribute("xmlns", SVG_NS);
+  if (!cleanSvg.getAttribute("viewBox")) {
+    const w = cleanSvg.getAttribute("width");
+    const h = cleanSvg.getAttribute("height");
+    if (w && h) {
+      cleanSvg.setAttribute("viewBox", `0 0 ${Number(w)} ${Number(h)}`);
+    } else {
+      cleanSvg.setAttribute("viewBox", "0 0 1000 1000");
+    }
+  }
+  // drop fixed sizing so container controls size
+  cleanSvg.removeAttribute("width");
+  cleanSvg.removeAttribute("height");
+
+  const ser = new XMLSerializer();
+  return ser.serializeToString(cleanSvg);
+}
+
+/**
+ * Public API: normalize raw server response into an embeddable <svg>.
+ * 1) fast regex scrub; 2) if still namespaced, XML rebuild.
+ */
+export function normalizeSvg(raw: string): string {
+  if (!raw) return "";
+  if (raw.trim().startsWith("{") || raw.trim().startsWith("[")) return ""; // looks like JSON error
+  let s = regexScrubNamespaces(raw);
+
+  // If any namespaced tag remains, rebuild via XML
+  if (/(^|<)\/?\s*[a-zA-Z_][\w.-]*:/.test(s) || /^<ns\d*:svg/i.test(raw.trim())) {
+    const rebuilt = xmlRebuildWithoutNamespaces(raw);
+    if (rebuilt) s = rebuilt;
+  }
+
+  // final sanity
+  return /<svg\b/i.test(s) ? s : "";
 }
