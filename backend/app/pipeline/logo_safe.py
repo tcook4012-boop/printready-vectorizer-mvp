@@ -8,42 +8,36 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageFilter
 
-# ============================================================
-# Helpers
-# ============================================================
+# =========================
+# Small helpers
+# =========================
 
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
-    """Normalize to RGBA (sRGB-ish)."""
-    if im.mode in ("P", "L", "RGB", "LA"):
-        im = im.convert("RGBA") if im.mode != "RGBA" else im
-    elif im.mode != "RGBA":
+    """Normalize to RGBA, sRGB-ish."""
+    if im.mode in ("P", "L"):
+        im = im.convert("RGBA")
+    elif im.mode == "RGB":
+        im = im.convert("RGBA")
+    elif im.mode == "LA":
+        im = im.convert("RGBA")
+    elif im.mode == "RGBA":
+        pass
+    else:
         im = im.convert("RGBA")
     return im
 
+
 def _composite_over_white(im: Image.Image) -> Image.Image:
-    """Flatten alpha over white; removes semi-transparent edge contamination."""
+    """Flatten alpha over white to kill semi-transparent halos."""
     if im.mode != "RGBA":
         return im.convert("RGB")
     bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
     out = Image.alpha_composite(bg, im)
     return out.convert("RGB")
 
-def _force_white_edges(im: Image.Image) -> Image.Image:
-    """
-    Hard-threshold pixels that are already very close to white.
-    This kills the purple/gray 'haze' that shows up around edges.
-    """
-    px = im.load()
-    w, h = im.size
-    for y in range(h):
-        for x in range(w):
-            r, g, b = px[x, y]
-            if r > 245 and g > 245 and b > 245:
-                px[x, y] = (255, 255, 255)
-    return im
 
 def _sample_bg_color(im: Image.Image) -> Tuple[int, int, int]:
-    """Modal of 4 corners to guess the background color."""
+    """Very quick modal of 4 corners to guess background color."""
     w, h = im.size
     pts = [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]
     samples = [im.getpixel(p) for p in pts]
@@ -52,14 +46,16 @@ def _sample_bg_color(im: Image.Image) -> Tuple[int, int, int]:
         counts[c] = counts.get(c, 0) + 1
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
+
 def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     """Fast RGB squared distance."""
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
-def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 10 * 10):
+
+def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11):
     """
-    Replace pixels close to background with pure white and grow the white region.
-    Raising the threshold + radius is what removes the residual haze.
+    Replace pixels close to the background with pure white, then grow by ~2px.
+    Stronger dist_thresh_sq eats more of the purple/grey fringe.
     """
     im = im.copy()
     w, h = im.size
@@ -71,55 +67,49 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 10 * 10):
     mp = mask.load()
     for y in range(h):
         for x in range(w):
-            if _color_dist(px[x, y], bg) <= dist_thresh_sq:
+            p = px[x, y]
+            if _color_dist(p, bg) <= dist_thresh_sq:
                 mp[x, y] = 255
 
-    # Grow the white mask ~3px to swallow soft fringe pixels
-    mask = mask.filter(ImageFilter.MaxFilter(size=7))
+    # grow mask ~2px
+    mask = mask.filter(ImageFilter.MaxFilter(size=5))
+    # set to white where mask = 255
     white = Image.new("RGB", im.size, (255, 255, 255))
     im.paste(white, mask=mask)
     return im
 
+
 def _upsample_2x(im: Image.Image) -> Image.Image:
-    """More pixels → smoother curves post-vectorization."""
     return im.resize((im.width * 2, im.height * 2), Image.Resampling.LANCZOS)
 
-def _smart_edge_smooth(im: Image.Image) -> Image.Image:
-    """
-    Curvature-aware smoothing:
-    bilateral filter preserves edges; light Gaussian removes pixel stair-steps.
-    """
-    import numpy as np
-    import cv2
-
-    arr = np.array(im)                      # RGB
-    arr_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    # d=5, sigmaColor/Space moderate to keep letter corners
-    out_bgr = cv2.bilateralFilter(arr_bgr, d=5, sigmaColor=40, sigmaSpace=40)
-    out_bgr = cv2.GaussianBlur(out_bgr, (3, 3), 0.6)
-    out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(out_rgb)
 
 def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
-    """Median cut to k colors without dithering."""
+    """Median cut to k colors, no dithering."""
     q = im.quantize(colors=k, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
     return q.convert("RGB")
 
+
 def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
-    Light morphological clean-up. Small Min/Max closes pinholes; mild blur smooths edges.
+    Light morphological clean-up:
+    Min -> Max (size=3) to close tiny gaps, then small blur to smooth edges.
+    Slightly stronger blur to smooth curves/stars more.
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.6))
+    im = im.filter(ImageFilter.GaussianBlur(radius=1.1))  # was 0.8
     return im
+
 
 def _reindex_to_palette(im: Image.Image, k: int) -> Image.Image:
     """Snap smoothed image back to an exact K-color palette."""
     return _quantize_no_dither(im, k)
 
+
 def _get_darkest_palette_color(pal_img: Image.Image) -> Tuple[int, int, int]:
-    """Find darkest used palette entry (by luma)."""
+    """
+    Find the darkest color (by luma) among used palette entries.
+    """
     if pal_img.mode != "P":
         tmp = pal_img.quantize(
             colors=min(16, (pal_img.getcolors() or [None] * 8).__len__()),
@@ -139,8 +129,10 @@ def _get_darkest_palette_color(pal_img: Image.Image) -> Tuple[int, int, int]:
             darkest = (r, g, b)
     return darkest
 
+
 def _rgb_to_hex(c: Tuple[int, int, int]) -> str:
     return "#{:02X}{:02X}{:02X}".format(*c)
+
 
 def _make_mask_for_color(im_rgb: Image.Image, target: Tuple[int, int, int]) -> Image.Image:
     """Binary mask where pixels equal the target color."""
@@ -154,11 +146,13 @@ def _make_mask_for_color(im_rgb: Image.Image, target: Tuple[int, int, int]) -> I
                 mp[x, y] = 1
     return mask
 
+
 def _write_temp_image(im: Image.Image, suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     im.save(path)
     return path
+
 
 def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
     proc = subprocess.Popen(
@@ -171,69 +165,77 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
     return proc.returncode, out, err
 
 
-# ============================================================
+# =========================
 # Main pipeline
-# ============================================================
+# =========================
 
-def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_max=6) -> bytes:
+def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Two-pass “logo-safe” pipeline:
-      1) Pre-clean (dehalo + curvature-aware smooth) → Quantize (no dither)
-      2) VTracer for fills
-      3) Potrace for darkest-color outlines (detail-preserving settings)
-      4) Compose: <paths> from Potrace on top of VTracer <svg>
+    Two-pass “logo-safe” vectorization:
+      1) Fills with VTracer
+      2) Strokes from darkest color with Potrace (stroke only, no fill)
+      3) Compose stroke group on top of fill SVG
     """
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
-    im = _composite_over_white(im)  # remove alpha
-    im = _force_white_edges(im)     # kill fringe haze
-    im = _upsample_2x(im)           # more pixels → smoother result
+    im = _composite_over_white(im)      # kills alpha halos
+    im = _upsample_2x(im)               # more pixels → cleaner curves
 
-    # 1) Dehalo + curvature-aware smoothing
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=10 * 10)  # stronger than before
-    im = _smart_edge_smooth(im)
+    # 1) Stronger dehalo to knock out fringe against white
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
 
-    # 2) Auto-K heuristic for palette size
-    approx_unique = len(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or [])
+    # 2) Estimate unique-ish colors and clamp palette to 3–4 colors.
+    approx_unique = len(
+        im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or []
+    )
     if approx_unique <= 3:
         k = 3
-    elif approx_unique >= auto_k_max:
-        k = auto_k_max
     else:
-        k = max(auto_k_min, min(auto_k_max, approx_unique))
+        k = 4  # cap at 4 so we don't keep extra fringe tones
 
-    # 3) Quantize and lightly regularize, then snap to palette again
+    # 3) Quantize (no dithering)
     im_q = _quantize_no_dither(im, k)
+
+    # 4) Gentle regularization and snap-to-palette
     im_smooth = _gentle_regularize(im_q)
     im_final = _reindex_to_palette(im_smooth, k)
 
-    # 4) Fills with VTracer
+    # 4b) Second dehalo pass to murder remaining near-white fringe
+    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=9 * 9)
+
+    # 5) Two-pass vectorization
+
+    # 5A) Fills with VTracer
     png_path = _write_temp_image(im_final, ".png")
-    fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg"); os.close(fills_svg_fd)
+    fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(fills_svg_fd)
 
     rc, _, err = _run(["vtracer", "-i", png_path, "-o", fills_svg_path])
     if rc != 0:
         raise RuntimeError(f"vtracer failed: {err.decode('utf-8', 'ignore')}")
 
-    # 5) Strokes (darkest color) with Potrace — small-detail friendly
+    # 5B) Strokes (darkest color) with Potrace
     darkest = _get_darkest_palette_color(im_final)
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # Slight erosion to avoid “bold” outlines; run once (can run twice if needed)
+    # tighten a bit so outlines don't bloat & stray specks disappear
+    mask = mask.filter(ImageFilter.MinFilter(3))
     mask = mask.filter(ImageFilter.MinFilter(3))
 
+    # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
-    stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg"); os.close(stroke_svg_fd)
+    stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(stroke_svg_fd)
 
     potrace_cmd = [
         "potrace",
         pbm_path,
         "--svg",
-        "--turdsize", "1",        # preserve tiny shapes (stars, counters)
-        "--alphamax", "1.0",      # lower = crisper corners, less rounding
-        "--opttolerance", "0.4",  # balance smoothness & fidelity
+        "--turdsize", "2",
+        "--alphamax", "1.2",      # crisper corners
+        "--opttolerance", "0.35", # smoother where it can be
         "--turnpolicy", "minority",
         "-o", stroke_svg_path,
     ]
@@ -241,7 +243,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     if rc != 0:
         raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
 
-    # 6) Compose Potrace paths on top of VTracer SVG
+    # 6) Compose SVG: use VTracer <svg> as base; import PATHS from Potrace on top
     fills_tree = ET.parse(fills_svg_path)
     fills_root = fills_tree.getroot()
 
@@ -251,6 +253,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     def _tag(t: str) -> str:
         return t.split("}")[-1] if "}" in t else t
 
+    # Create a stroke group with explicit stroke attributes (NO fill!)
     stroke_group = ET.Element(
         "g",
         attrib={
@@ -276,7 +279,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes, auto_k_min=4, auto_k_ma
     # 7) Serialize to bytes
     svg_bytes = ET.tostring(fills_root, encoding="utf-8", method="xml")
 
-    # Cleanup
+    # cleanup temp files
     for p in (png_path, fills_svg_path, pbm_path, stroke_svg_path):
         try:
             os.remove(p)
