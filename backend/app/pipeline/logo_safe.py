@@ -53,7 +53,6 @@ def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
 def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11) -> Image.Image:
     """
     Replace pixels close to the background with pure white, then grow by ~2px.
-    Stronger dist_thresh_sq eats more of the purple/grey fringe.
     """
     im = im.copy()
     w, h = im.size
@@ -74,6 +73,22 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11) ->
     # set to white where mask = 255
     white = Image.new("RGB", im.size, (255, 255, 255))
     im.paste(white, mask=mask)
+    return im
+
+
+def _snap_near_black_to_black(im: Image.Image, thresh: int = 45) -> Image.Image:
+    """
+    Force very dark neutral pixels to pure black so outlines & text
+    don't get merged into dark brown / red clusters.
+    """
+    im = im.convert("RGB")
+    px = im.load()
+    w, h = im.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            if r < thresh and g < thresh and b < thresh:
+                px[x, y] = (0, 0, 0)
     return im
 
 
@@ -110,7 +125,7 @@ def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
+    im = im.filter(ImageFilter.GaussianBlur(radius=0.6))
     return im
 
 
@@ -201,6 +216,7 @@ def _estimate_logo_palette_size(im: Image.Image, max_k: int = 8) -> Tuple[int, i
         if _color_dist((r, g, b), bg) > bg_thresh_sq:
             non_bg_count += 1
 
+    # Choose palette size based on complexity
     if non_bg_count <= 1:
         k = 3          # one logo color + background
     elif non_bg_count == 2:
@@ -224,9 +240,10 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     Logo-safe vectorization:
       - Palette-aware dehalo
       - Conditional upsample for smooth curves
+      - Snap near-black to pure black (better text & outlines)
       - Fills via VTracer
       - Optional strokes on darkest color via Potrace
-        (used mainly for 2-color sign/logos)
+        (used mainly for 1–2-color sign/logos)
     """
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
@@ -234,8 +251,11 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im = _composite_over_white(im)
     im = _upsample_logo(im)
 
-    # 1) Dehalo to kill background fringe (slightly stronger)
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=13 * 13)
+    # 1) Dehalo to kill background fringe (original strength)
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
+
+    # Snap very dark neutrals to pure black BEFORE palette analysis
+    im = _snap_near_black_to_black(im, thresh=45)
 
     # 2) Palette estimation & quantization
     k, non_bg = _estimate_logo_palette_size(im, max_k=8)
@@ -245,8 +265,8 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im_smooth = _gentle_regularize(im_q)
     im_final = _reindex_to_palette(im_smooth, k)
 
-    # 4) Second dehalo pass (slightly tighter) to clean residual fringe
-    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=11 * 11)
+    # 4) Second dehalo pass (slightly tighter, original value)
+    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=9 * 9)
 
     # 5A) Fills with VTracer
     png_path = _write_temp_image(im_final, ".png")
@@ -273,9 +293,9 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
         stroke_color_hex = _rgb_to_hex(darkest)
 
         mask = _make_mask_for_color(im_final, darkest)
-        # tighten slightly, then close gaps
+        # ORIGINAL behavior for mask: erode twice to sharpen/thin and drop specks
         mask = mask.filter(ImageFilter.MinFilter(3))
-        mask = mask.filter(ImageFilter.MaxFilter(3))
+        mask = mask.filter(ImageFilter.MinFilter(3))
 
         pbm_path = _write_temp_image(mask, ".pbm")
         stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
@@ -286,7 +306,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
             pbm_path,
             "--svg",
             "--turdsize",
-            "6",                 # higher: drop tiny squiggles
+            "6",                 # drop tiny squiggles
             "--alphamax",
             "1.2",
             "--opttolerance",
