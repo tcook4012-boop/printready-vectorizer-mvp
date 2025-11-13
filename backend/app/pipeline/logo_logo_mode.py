@@ -112,9 +112,11 @@ def _gentle_regularize_logo(im: Image.Image) -> Image.Image:
 
     - small Min/Max filters to close tiny gaps without shrinking shapes
     - lighter blur to keep edges smoother but not melted
+
+    NOTE: Pillow requires an ODD filter size (3, 5, ...) for MinFilter/MaxFilter.
     """
-    im = im.filter(ImageFilter.MinFilter(2))
-    im = im.filter(ImageFilter.MaxFilter(2))
+    im = im.filter(ImageFilter.MinFilter(3))
+    im = im.filter(ImageFilter.MaxFilter(3))
     im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
     return im
 
@@ -131,7 +133,7 @@ def _write_temp_image(im: Image.Image, suffix: str) -> str:
     return path
 
 
-def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
+def _run(cmd: list, input_bytes: Optional[bytes] = None):
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE if input_bytes else None,
@@ -171,7 +173,6 @@ def vectorize_logo_logo_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
     im = _dehalo_to_white(im, bg=None, dist_thresh_sq=9 * 9)
 
     # 2) Estimate unique-ish colors and choose palette size.
-    #    For logos like ELON we may have 4–5 distinct colors, so allow a bit more.
     pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=8)
     approx_unique = len(pal_img.getcolors() or [])
 
@@ -203,10 +204,4 @@ def vectorize_logo_logo_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
         svg_bytes = f.read()
 
     # Cleanup
-    for p in (png_path, svg_path):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-    return svg_bytes
+    for p in (png_p_
