@@ -12,7 +12,6 @@ from PIL import Image, ImageFilter
 # Small helpers
 # =========================
 
-
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
     """Normalize to RGBA, sRGB-ish."""
     if im.mode in ("P", "L"):
@@ -53,29 +52,12 @@ def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
-def _luma(c: Tuple[int, int, int]) -> float:
-    """Perceptual brightness for background / halo detection."""
-    r, g, b = c
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-
-def _dehalo_to_white(
-    im: Image.Image,
-    bg: Optional[Tuple[int, int, int]] = None,
-    dist_thresh_sq: int = 11 * 11,
-    bright_luma_thresh: float = 245.0,
-):
+def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11):
     """
-    Replace pixels close to the background OR very bright with pure white,
-    then grow by ~2px.
-
-    - dist_thresh_sq: squared RGB distance threshold to bg sample.
-    - bright_luma_thresh: pixels brighter than this are treated as halo / bg.
-
-    Stronger settings eat more of the purple/grey fringe without chewing into
-    real foreground strokes.
+    Replace pixels close to the background with pure white, then grow by ~2px.
+    Stronger dist_thresh_sq eats more of the purple/grey fringe.
     """
-    im = im.copy().convert("RGB")
+    im = im.copy()
     w, h = im.size
     if bg is None:
         bg = _sample_bg_color(im)
@@ -83,11 +65,10 @@ def _dehalo_to_white(
     px = im.load()
     mask = Image.new("L", im.size, 0)
     mp = mask.load()
-
     for y in range(h):
         for x in range(w):
             p = px[x, y]
-            if _color_dist(p, bg) <= dist_thresh_sq or _luma(p) >= bright_luma_thresh:
+            if _color_dist(p, bg) <= dist_thresh_sq:
                 mp[x, y] = 255
 
     # grow mask ~2px
@@ -112,13 +93,11 @@ def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
     Light morphological clean-up:
     Min -> Max (size=3) to close tiny gaps, then small blur to smooth edges.
-
-    Blur radius is kept modest so we don't smear distinct logo colors together
-    before re-quantization.
+    Slightly stronger blur to smooth curves/stars more.
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.9))  # was 1.1
+    im = im.filter(ImageFilter.GaussianBlur(radius=1.1))  # was 0.8
     return im
 
 
@@ -190,7 +169,6 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
 # Main pipeline
 # =========================
 
-
 def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
     Two-pass “logo-safe” vectorization:
@@ -204,20 +182,17 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im = _composite_over_white(im)      # kills alpha halos
     im = _upsample_2x(im)               # more pixels → cleaner curves
 
-    # 1) Stronger dehalo / background normalize to knock out fringe against white
-    #    First pass: more aggressive distance threshold
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=12 * 12, bright_luma_thresh=245.0)
+    # 1) Stronger dehalo to knock out fringe against white
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
 
-    # 2) Estimate unique-ish colors and clamp palette size.
+    # 2) Estimate unique-ish colors and clamp palette to 3–4 colors.
     approx_unique = len(
         im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or []
     )
     if approx_unique <= 3:
         k = 3
-    elif approx_unique <= 5:
-        k = 4
     else:
-        k = 5  # allow up to 5 colors so multi-color logos don't collapse
+        k = 4  # cap at 4 so we don't keep extra fringe tones
 
     # 3) Quantize (no dithering)
     im_q = _quantize_no_dither(im, k)
@@ -227,7 +202,88 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im_final = _reindex_to_palette(im_smooth, k)
 
     # 4b) Second dehalo pass to murder remaining near-white fringe
-    #     Slightly tighter distance; same bright luma cutoff.
-    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=9 * 9, bright_luma_thresh=245.0)
+    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=9 * 9)
 
-    #
+    # 5) Two-pass vectorization
+
+    # 5A) Fills with VTracer
+    png_path = _write_temp_image(im_final, ".png")
+    fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(fills_svg_fd)
+
+    rc, _, err = _run(["vtracer", "-i", png_path, "-o", fills_svg_path])
+    if rc != 0:
+        raise RuntimeError(f"vtracer failed: {err.decode('utf-8', 'ignore')}")
+
+    # 5B) Strokes (darkest color) with Potrace
+    darkest = _get_darkest_palette_color(im_final)
+    stroke_color_hex = _rgb_to_hex(darkest)
+
+    mask = _make_mask_for_color(im_final, darkest)
+    # tighten a bit so outlines don't bloat & stray specks disappear
+    mask = mask.filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MinFilter(3))
+
+    # Potrace wants PBM (1-bit)
+    pbm_path = _write_temp_image(mask, ".pbm")
+    stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(stroke_svg_fd)
+
+    potrace_cmd = [
+        "potrace",
+        pbm_path,
+        "--svg",
+        "--turdsize", "2",
+        "--alphamax", "1.2",      # crisper corners
+        "--opttolerance", "0.35", # smoother where it can be
+        "--turnpolicy", "minority",
+        "-o", stroke_svg_path,
+    ]
+    rc, _, err = _run(potrace_cmd)
+    if rc != 0:
+        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
+
+    # 6) Compose SVG: use VTracer <svg> as base; import PATHS from Potrace on top
+    fills_tree = ET.parse(fills_svg_path)
+    fills_root = fills_tree.getroot()
+
+    stroke_tree = ET.parse(stroke_svg_path)
+    stroke_root = stroke_tree.getroot()
+
+    def _tag(t: str) -> str:
+        return t.split("}")[-1] if "}" in t else t
+
+    # Create a stroke group with explicit stroke attributes (NO fill!)
+    stroke_group = ET.Element(
+        "g",
+        attrib={
+            "id": "stroke-layer",
+            "fill": "none",
+            "stroke": stroke_color_hex,
+            "stroke-width": "2",
+            "stroke-linejoin": "round",
+            "stroke-linecap": "round",
+        },
+    )
+
+    for el in stroke_root.iter():
+        if _tag(el.tag) == "path":
+            el.attrib.pop("fill", None)
+            el.set("stroke", stroke_color_hex)
+            el.set("stroke-width", "2")
+            el.set("fill", "none")
+            stroke_group.append(el)
+
+    fills_root.append(stroke_group)
+
+    # 7) Serialize to bytes
+    svg_bytes = ET.tostring(fills_root, encoding="utf-8", method="xml")
+
+    # cleanup temp files
+    for p in (png_path, fills_svg_path, pbm_path, stroke_svg_path):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return svg_bytes
