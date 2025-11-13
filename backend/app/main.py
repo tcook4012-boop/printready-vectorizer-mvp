@@ -1,70 +1,63 @@
-# app/main.py
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+# backend/app/main.py
+
+import io
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse, RedirectResponse
-import os
+from fastapi.responses import JSONResponse
 
-# Our logo-safe pipeline (drop-in file you added at app/pipeline/logo_safe.py)
-from app.pipeline.logo_safe import vectorize_logo_safe_to_svg_bytes
+# NOTE:
+# Previously this imported:
+#   from app.pipeline.logo_safe import vectorize_logo_safe_to_svg_bytes
+# We now go through a thin dual-mode wrapper so we can evolve the internals
+# without touching this file again.
+from app.pipeline.logo_dualmode import vectorize_logo_dualmode_to_svg_bytes
 
-app = FastAPI(title="PrintReady Vectorizer API", version="0.1.0")
+app = FastAPI(title="PrintReady Vectorizer API")
 
-# ----- CORS -----
-# Allow your frontend (Vercel) to call this API.
-# You can set ALLOWED_ORIGINS in Render env (comma-separated) or just fall back to "*".
-allowed = os.getenv("ALLOWED_ORIGINS", "*")
-origins = [o.strip() for o in allowed.split(",")] if allowed else ["*"]
-
+# Allow frontend origin (Vercel) to call API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # you can tighten this later to your exact frontend origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----- Health/landing -----
-@app.get("/")
-def root():
-    # Small landing + link to docs
-    return {"ok": True, "service": "printready-vectorizer-api", "docs": "/docs"}
 
-@app.get("/docs/")
-def docs_redirect():
-    # Nice-to-have: redirect /docs/ -> /docs
-    return RedirectResponse(url="/docs")
-
-# ----- Vectorize endpoint -----
 @app.post("/vectorize")
-async def vectorize(
-    file: UploadFile = File(..., description="Raster to vectorize"),
-    preset: str = Form(default="logo-safe", description="Pipeline preset (default: logo-safe)"),
-):
+async def vectorize(file: UploadFile = File(...)):
     """
-    Vectorizes a raster image to SVG.
+    Main vectorization endpoint.
 
-    - Default preset: logo-safe (dehalo → quantize → clean → VTracer fills + Potrace strokes → compose)
-    - Returns: SVG (image/svg+xml)
+    - Accepts: multipart/form-data with 'file'
+    - Returns: JSON { "svg": "<svg ...>...</svg>" }
     """
     try:
-        data = await file.read()
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file upload")
 
-        # Only 'logo-safe' is implemented here. You can branch for other presets later.
-        if preset in (None, "", "logo-safe"):
-            svg_bytes = vectorize_logo_safe_to_svg_bytes(data)
-            return Response(content=svg_bytes, media_type="image/svg+xml")
+        # Call the dual-mode wrapper. Right now this behaves exactly like the
+        # existing logo_safe pipeline, but it gives us a stable hook for
+        # future "logo vs sign" improvements.
+        svg_bytes = vectorize_logo_dualmode_to_svg_bytes(image_bytes)
+        svg_text = svg_bytes.decode("utf-8", errors="replace")
 
-        raise HTTPException(status_code=400, detail=f"Unknown preset: {preset}")
+        # Minimal sanity check to catch non-SVG responses
+        if "<svg" not in svg_text.lower():
+            raise HTTPException(
+                status_code=500,
+                detail="Vectorization pipeline returned non-SVG text",
+            )
 
+        return JSONResponse({"svg": svg_text})
     except HTTPException:
+        # Re-raise FastAPI HTTPExceptions so status codes are preserved
         raise
     except Exception as e:
-        # Keep a compact, debuggable JSON error body for the frontend
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "vectorization failed",
-                "stderr": str(e),
-                "cmd": ["vtracer", "potrace", "(logo-safe)"],
-            },
-        )
+        # Catch-all for unexpected errors, so the frontend gets a clean message
+        raise HTTPException(status_code=500, detail=f"vectorization failed: {e}")
+
+
+# For local dev (inside backend/app directory):
+#   uvicorn main:app --reload --host 0.0.0.0 --port 8000
