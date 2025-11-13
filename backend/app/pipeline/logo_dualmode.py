@@ -1,24 +1,29 @@
 # backend/app/pipeline/logo_dualmode.py
 
 """
-Thin wrapper around the current logo_safe pipeline.
+Dual-mode wrapper around the existing logo_safe pipeline.
 
-Right now this just delegates to the baseline logo_safe implementation, so
-behaviour is IDENTICAL to your existing system.
+GOAL
+----
+Provide two separate "flavours" of vectorization:
 
-The point of this file is to give us a stable place to implement smarter
-"logo vs sign" routing and future improvements without touching the FastAPI
-endpoint or your original baseline snapshot.
+  - "sign"  → text-safe, detail-preserving (yard signs, PECANS, Murillo)
+  - "logo"  → logo/mascot friendly, can smooth curves a bit more (ELON, patches)
+
+Right now BOTH modes still call the same baseline pipeline so behaviour is
+identical to your current system. This file just creates a clean place to
+evolve the internals without touching FastAPI or the baseline snapshot.
+
+We also keep a tiny "auto" mode hook so later we can have the backend choose
+between "sign" and "logo" automatically.
 """
 
 from typing import Literal
 
+# This is the current production pipeline implementation.
 from .logo_safe import vectorize_logo_safe_to_svg_bytes as _baseline_vectorize
 
-# In the future we'll support:
-#   - "auto"      → analyze image and pick best mode
-#   - "logo"      → flatter, more aggressive smoothing (ELON-style art)
-#   - "sign"      → text-safe, detail-preserving (Murillo, PECANS, flags)
+# Public mode type. FastAPI currently always calls this with the default "auto".
 Mode = Literal["auto", "logo", "sign"]
 
 
@@ -26,12 +31,44 @@ def _analyze_mode(image_bytes: bytes) -> Mode:
     """
     Placeholder for future image analysis.
 
-    For now we always return "auto" and simply delegate to the baseline
-    pipeline. When we implement true dual-mode behaviour, this function will
-    inspect the image (density of thin strokes, number of colors, etc) and
-    choose "logo" vs "sign".
+    Eventually this will inspect the image (colors, stroke thickness, text
+    density, etc.) and return "logo" or "sign".
+
+    For now we simply return "sign" as a conservative default. Since both
+    paths currently call the same baseline pipeline, this does not change
+    behaviour at all.
     """
-    return "auto"
+    return "sign"
+
+
+def _vectorize_sign_like(image_bytes: bytes) -> bytes:
+    """
+    Sign/text-safe variant.
+
+    CURRENTLY:
+      - Just calls the baseline pipeline.
+
+    FUTURE:
+      - Keep edges crisp
+      - Avoid shrinking text
+      - Aggressively kill halos without over-blurring
+    """
+    return _baseline_vectorize(image_bytes)
+
+
+def _vectorize_logo_like(image_bytes: bytes) -> bytes:
+    """
+    Logo/mascot variant.
+
+    CURRENTLY:
+      - Just calls the baseline pipeline.
+
+    FUTURE:
+      - Slightly more smoothing for curves
+      - More tolerant of organic shapes
+      - Extra care around color separation (no unwanted outlines)
+    """
+    return _baseline_vectorize(image_bytes)
 
 
 def vectorize_logo_dualmode_to_svg_bytes(
@@ -39,23 +76,26 @@ def vectorize_logo_dualmode_to_svg_bytes(
     mode: Mode = "auto",
 ) -> bytes:
     """
-    Entry point used by FastAPI.
+    Single entry point used by FastAPI.
 
-    CURRENT BEHAVIOUR:
-    -------------------
-    We always call the existing logo_safe pipeline, so the output is
-    identical to your current system.
+    - mode="auto": backend chooses between "sign" and "logo" (later)
+    - mode="sign": force sign/text-optimised path
+    - mode="logo": force logo/mascot-optimised path
 
-    FUTURE BEHAVIOUR:
-    ------------------
-    - If mode == "logo":   use logo-optimised settings
-    - If mode == "sign":   use sign/text-optimised settings
-    - If mode == "auto":   call _analyze_mode(...) to decide
-
-    Keeping the API signature stable means the FastAPI endpoint doesn't need
-    to change when we improve the internals.
+    At the moment both paths are identical and use the baseline pipeline, so
+    this wrapper is behaviourally neutral.
     """
-    # For now we ignore the mode and call the baseline pipeline directly.
-    # This guarantees no behavioural change while we wire up the architecture.
-    _ = _analyze_mode(image_bytes)  # noqa: F841 (unused for now)
-    return _baseline_vectorize(image_bytes)
+    # Resolve "auto" into a concrete mode.
+    if mode == "auto":
+        inferred = _analyze_mode(image_bytes)
+        if inferred in ("logo", "sign"):
+            mode = inferred
+        else:
+            # Safety fallback – never return "auto" from the analyser.
+            mode = "sign"
+
+    if mode == "logo":
+        return _vectorize_logo_like(image_bytes)
+    else:
+        # Default to the sign-safe path for now.
+        return _vectorize_sign_like(image_bytes)
