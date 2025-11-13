@@ -12,6 +12,7 @@ from PIL import Image, ImageFilter
 # Small helpers
 # =========================
 
+
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
     """Normalize to RGBA, sRGB-ish."""
     if im.mode in ("P", "L"):
@@ -169,6 +170,7 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
 # Main pipeline
 # =========================
 
+
 def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
     Two-pass “logo-safe” vectorization:
@@ -220,9 +222,11 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # tighten a bit so outlines don't bloat & stray specks disappear
+    # Morphology for the stroke mask:
+    # - One MinFilter(3) to remove isolated specks and tighten edges slightly
+    # - One MaxFilter(3) to close tiny gaps / breaks without over-eroding thin strokes
     mask = mask.filter(ImageFilter.MinFilter(3))
-    mask = mask.filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MaxFilter(3))
 
     # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
