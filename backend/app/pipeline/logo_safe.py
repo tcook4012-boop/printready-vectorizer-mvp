@@ -172,8 +172,8 @@ def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
     choose a reasonable K for quantization.
 
     This avoids the ELON issue where 3 non-white colors get merged into
-    one because K was capped at 4 and most palette slots were used for
-    slightly different whites.
+    one because K was capped too low and most palette slots were used
+    for slightly different whites.
     """
     # Small adaptive palette view of the image
     pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
@@ -223,7 +223,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im = _composite_over_white(im)      # kills alpha halos
     im = _upsample_2x(im)               # more pixels → cleaner curves
 
-    # 1) Stronger dehalo to knock out fringe against white
+    # 1) Strong dehalo to knock out fringe against white
     im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
 
     # 2) Estimate palette size based on non-background colors.
@@ -272,15 +272,20 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
         "potrace",
         pbm_path,
         "--svg",
-        "--turdsize", "4",        # was 2; ignore smaller specks/rogue lines
-        "--alphamax", "1.2",      # crisper corners
-        "--opttolerance", "0.35", # smoother where it can be
-        "--turnpolicy", "minority",
-        "-o", stroke_svg_path,
+        "--turdsize",
+        "4",                 # was 2; ignore smaller specks/rogue lines
+        "--alphamax",
+        "1.2",               # crisper corners
+        "--opttolerance",
+        "0.35",              # smoother where it can be
+        "--turnpolicy",
+        "minority",
+        "-o",
+        stroke_svg_path,
     ]
     rc, _, err = _run(potrace_cmd)
     if rc != 0:
-        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore")}")
+        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
 
     # 6) Compose SVG: use VTracer <svg> as base; import PATHS from Potrace on top
     fills_tree = ET.parse(fills_svg_path)
