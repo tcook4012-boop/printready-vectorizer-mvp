@@ -1,4 +1,3 @@
-# app/pipeline/logo_safe.py
 import io
 import os
 import subprocess
@@ -7,6 +6,7 @@ import xml.etree.ElementTree as ET
 from typing import Optional, Tuple
 
 from PIL import Image, ImageFilter
+
 
 # =========================
 # Small helpers
@@ -80,10 +80,9 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11):
     return im
 
 
-def _upsample_2x(im: Image.Image) -> Image.Image:
+def _upsample_logo(im: Image.Image) -> Image.Image:
     """
     3× upsample for smoother diagonals/curves.
-    Name kept for backwards compatibility.
     """
     return im.resize((im.width * 3, im.height * 3), Image.Resampling.LANCZOS)
 
@@ -219,7 +218,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
     im = _composite_over_white(im)
-    im = _upsample_2x(im)
+    im = _upsample_logo(im)
 
     # 1) Dehalo to kill background fringe (slightly stronger)
     im = _dehalo_to_white(im, bg=None, dist_thresh_sq=13 * 13)
@@ -236,4 +235,86 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=11 * 11)
 
     # 5A) Fills with VTracer
-    png_path = _write_temp_image(im
+    png_path = _write_temp_image(im_final, ".png")
+    fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(fills_svg_fd)
+
+    rc, _, err = _run(["vtracer", "-i", png_path, "-o", fills_svg_path])
+    if rc != 0:
+        raise RuntimeError(f"vtracer failed: {err.decode('utf-8', 'ignore')}")
+
+    # 5B) Strokes with Potrace from darkest color
+    darkest = _get_darkest_palette_color(im_final)
+    stroke_color_hex = _rgb_to_hex(darkest)
+
+    mask = _make_mask_for_color(im_final, darkest)
+    # tighten slightly, then close gaps
+    mask = mask.filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MaxFilter(3))
+
+    pbm_path = _write_temp_image(mask, ".pbm")
+    stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
+    os.close(stroke_svg_fd)
+
+    potrace_cmd = [
+        "potrace",
+        pbm_path,
+        "--svg",
+        "--turdsize",
+        "6",                 # higher: drop tiny squiggles
+        "--alphamax",
+        "1.2",
+        "--opttolerance",
+        "0.35",
+        "--turnpolicy",
+        "minority",
+        "-o",
+        stroke_svg_path,
+    ]
+    rc, _, err = _run(potrace_cmd)
+    if rc != 0:
+        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
+
+    # 6) Compose SVG: VTracer fills + Potrace strokes
+    fills_tree = ET.parse(fills_svg_path)
+    fills_root = fills_tree.getroot()
+
+    stroke_tree = ET.parse(stroke_svg_path)
+    stroke_root = stroke_tree.getroot()
+
+    def _tag(t: str) -> str:
+        return t.split("}")[-1] if "}" in t else t
+
+    stroke_group = ET.Element(
+        "g",
+        attrib={
+            "id": "stroke-layer",
+            "fill": "none",
+            "stroke": stroke_color_hex,
+            "stroke-width": "2",
+            "stroke-linejoin": "round",
+            "stroke-linecap": "round",
+        },
+    )
+
+    for el in stroke_root.iter():
+        if _tag(el.tag) == "path":
+            el.attrib.pop("fill", None)
+            el.set("stroke", stroke_color_hex)
+            el.set("stroke-width", "2")
+            el.set("fill", "none")
+            stroke_group.append(el)
+
+    fills_root.append(stroke_group)
+
+    # 7) Serialize to bytes
+    svg_bytes = ET.tostring(fills_root, encoding="utf-8", method="xml")
+
+    # cleanup temp files
+    for p in (png_path, fills_svg_path, pbm_path, stroke_svg_path):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return svg_bytes
