@@ -12,6 +12,7 @@ from PIL import Image, ImageFilter
 # Small helpers
 # =========================
 
+
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
     """Normalize to RGBA, sRGB-ish."""
     if im.mode in ("P", "L"):
@@ -165,9 +166,49 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
     return proc.returncode, out, err
 
 
+def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
+    """
+    Estimate how many *non-background* colors the logo really has and
+    choose a reasonable K for quantization.
+
+    This avoids the ELON issue where 3 non-white colors get merged into
+    one because K was capped at 4 and most palette slots were used for
+    slightly different whites.
+    """
+    # Small adaptive palette view of the image
+    pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+    colors = pal_img.getcolors(maxcolors=256) or []
+    if not colors:
+        return 3
+
+    pal = pal_img.getpalette()
+    bg = _sample_bg_color(im)
+    # anything reasonably far from the bg is "non-background"
+    bg_thresh_sq = 20 * 20
+
+    non_bg_count = 0
+    for _, idx in colors:
+        r, g, b = pal[idx * 3 : idx * 3 + 3]
+        if _color_dist((r, g, b), bg) > bg_thresh_sq:
+            non_bg_count += 1
+
+    # Map non-bg color count to a palette size; clamp to [3, max_k]
+    if non_bg_count <= 1:
+        k = 3  # one logo color + background
+    elif non_bg_count == 2:
+        k = 4
+    elif non_bg_count == 3:
+        k = 5
+    else:
+        k = max_k
+
+    return max(3, min(k, max_k))
+
+
 # =========================
 # Main pipeline
 # =========================
+
 
 def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
@@ -185,14 +226,10 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     # 1) Stronger dehalo to knock out fringe against white
     im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
 
-    # 2) Estimate unique-ish colors and clamp palette to 3–4 colors.
-    approx_unique = len(
-        im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16).getcolors() or []
-    )
-    if approx_unique <= 3:
-        k = 3
-    else:
-        k = 4  # cap at 4 so we don't keep extra fringe tones
+    # 2) Estimate palette size based on non-background colors.
+    #    This prevents multi-color logos (like ELON) from collapsing
+    #    into a single silhouette color.
+    k = _estimate_logo_palette_size(im, max_k=6)
 
     # 3) Quantize (no dithering)
     im_q = _quantize_no_dither(im, k)
@@ -220,9 +257,11 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     stroke_color_hex = _rgb_to_hex(darkest)
 
     mask = _make_mask_for_color(im_final, darkest)
-    # tighten a bit so outlines don't bloat & stray specks disappear
+    # Morphology for the stroke mask:
+    # - One MinFilter(3) to remove isolated specks and tighten edges slightly
+    # - One MaxFilter(3) to close tiny gaps / breaks without over-eroding thin strokes
     mask = mask.filter(ImageFilter.MinFilter(3))
-    mask = mask.filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MaxFilter(3))
 
     # Potrace wants PBM (1-bit)
     pbm_path = _write_temp_image(mask, ".pbm")
@@ -233,7 +272,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
         "potrace",
         pbm_path,
         "--svg",
-        "--turdsize", "2",
+        "--turdsize", "4",        # was 2; ignore smaller specks/rogue lines
         "--alphamax", "1.2",      # crisper corners
         "--opttolerance", "0.35", # smoother where it can be
         "--turnpolicy", "minority",
@@ -241,7 +280,7 @@ def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     ]
     rc, _, err = _run(potrace_cmd)
     if rc != 0:
-        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
+        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore")}")
 
     # 6) Compose SVG: use VTracer <svg> as base; import PATHS from Potrace on top
     fills_tree = ET.parse(fills_svg_path)
