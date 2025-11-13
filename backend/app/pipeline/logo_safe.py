@@ -81,7 +81,11 @@ def _dehalo_to_white(im: Image.Image, bg=None, dist_thresh_sq: int = 11 * 11):
 
 
 def _upsample_2x(im: Image.Image) -> Image.Image:
-    return im.resize((im.width * 2, im.height * 2), Image.Resampling.LANCZOS)
+    """
+    3× upsample for smoother diagonals/curves.
+    Name kept for backwards compatibility.
+    """
+    return im.resize((im.width * 3, im.height * 3), Image.Resampling.LANCZOS)
 
 
 def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
@@ -92,13 +96,13 @@ def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
 
 def _gentle_regularize(im: Image.Image) -> Image.Image:
     """
-    Light morphological clean-up:
-    Min -> Max (size=3) to close tiny gaps, then small blur to smooth edges.
-    Slightly stronger blur to smooth curves/stars more.
+    Mild clean-up:
+    - MinFilter then MaxFilter to remove specks and close tiny gaps
+    - Small Gaussian blur to smooth edges without overly rounding corners
     """
     im = im.filter(ImageFilter.MinFilter(3))
     im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=1.1))  # was 0.8
+    im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
     return im
 
 
@@ -155,7 +159,7 @@ def _write_temp_image(im: Image.Image, suffix: str) -> str:
     return path
 
 
-def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
+def _run(cmd: list, input_bytes: Optional[bytes] = None):
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE if input_bytes else None,
@@ -166,16 +170,11 @@ def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, by
     return proc.returncode, out, err
 
 
-def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
+def _estimate_logo_palette_size(im: Image.Image, max_k: int = 8) -> int:
     """
-    Estimate how many *non-background* colors the logo really has and
-    choose a reasonable K for quantization.
-
-    This avoids the ELON issue where 3 non-white colors get merged into
-    one because K was capped too low and most palette slots were used
-    for slightly different whites.
+    Estimate how many non-background colors there are and choose a
+    palette size that preserves them while staying logo-friendly.
     """
-    # Small adaptive palette view of the image
     pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
     colors = pal_img.getcolors(maxcolors=256) or []
     if not colors:
@@ -183,7 +182,6 @@ def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
 
     pal = pal_img.getpalette()
     bg = _sample_bg_color(im)
-    # anything reasonably far from the bg is "non-background"
     bg_thresh_sq = 20 * 20
 
     non_bg_count = 0
@@ -192,15 +190,14 @@ def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
         if _color_dist((r, g, b), bg) > bg_thresh_sq:
             non_bg_count += 1
 
-    # Map non-bg color count to a palette size; clamp to [3, max_k]
     if non_bg_count <= 1:
-        k = 3  # one logo color + background
+        k = 3          # one logo color + background
     elif non_bg_count == 2:
-        k = 4
-    elif non_bg_count == 3:
         k = 5
+    elif non_bg_count == 3:
+        k = 6
     else:
-        k = max_k
+        k = max_k      # richer logos → allow more clusters
 
     return max(3, min(k, max_k))
 
@@ -212,122 +209,31 @@ def _estimate_logo_palette_size(im: Image.Image, max_k: int = 6) -> int:
 
 def vectorize_logo_safe_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Two-pass “logo-safe” vectorization:
-      1) Fills with VTracer
-      2) Strokes from darkest color with Potrace (stroke only, no fill)
-      3) Compose stroke group on top of fill SVG
+    Logo-safe vectorization:
+      - Palette-aware dehalo
+      - Higher upsample for smooth curves
+      - Fills via VTracer
+      - Strokes on darkest color via Potrace
     """
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
-    im = _composite_over_white(im)      # kills alpha halos
-    im = _upsample_2x(im)               # more pixels → cleaner curves
+    im = _composite_over_white(im)
+    im = _upsample_2x(im)
 
-    # 1) Strong dehalo to knock out fringe against white
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=11 * 11)
+    # 1) Dehalo to kill background fringe (slightly stronger)
+    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=13 * 13)
 
-    # 2) Estimate palette size based on non-background colors.
-    #    This prevents multi-color logos (like ELON) from collapsing
-    #    into a single silhouette color.
-    k = _estimate_logo_palette_size(im, max_k=6)
-
-    # 3) Quantize (no dithering)
+    # 2) Palette estimation & quantization
+    k = _estimate_logo_palette_size(im, max_k=8)
     im_q = _quantize_no_dither(im, k)
 
-    # 4) Gentle regularization and snap-to-palette
+    # 3) Regularize & snap back to palette
     im_smooth = _gentle_regularize(im_q)
     im_final = _reindex_to_palette(im_smooth, k)
 
-    # 4b) Second dehalo pass to murder remaining near-white fringe
-    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=9 * 9)
-
-    # 5) Two-pass vectorization
+    # 4) Second dehalo pass (slightly tighter) to clean residual fringe
+    im_final = _dehalo_to_white(im_final, bg=None, dist_thresh_sq=11 * 11)
 
     # 5A) Fills with VTracer
-    png_path = _write_temp_image(im_final, ".png")
-    fills_svg_fd, fills_svg_path = tempfile.mkstemp(suffix=".svg")
-    os.close(fills_svg_fd)
-
-    rc, _, err = _run(["vtracer", "-i", png_path, "-o", fills_svg_path])
-    if rc != 0:
-        raise RuntimeError(f"vtracer failed: {err.decode('utf-8', 'ignore')}")
-
-    # 5B) Strokes (darkest color) with Potrace
-    darkest = _get_darkest_palette_color(im_final)
-    stroke_color_hex = _rgb_to_hex(darkest)
-
-    mask = _make_mask_for_color(im_final, darkest)
-    # Morphology for the stroke mask:
-    # - One MinFilter(3) to remove isolated specks and tighten edges slightly
-    # - One MaxFilter(3) to close tiny gaps / breaks without over-eroding thin strokes
-    mask = mask.filter(ImageFilter.MinFilter(3))
-    mask = mask.filter(ImageFilter.MaxFilter(3))
-
-    # Potrace wants PBM (1-bit)
-    pbm_path = _write_temp_image(mask, ".pbm")
-    stroke_svg_fd, stroke_svg_path = tempfile.mkstemp(suffix=".svg")
-    os.close(stroke_svg_fd)
-
-    potrace_cmd = [
-        "potrace",
-        pbm_path,
-        "--svg",
-        "--turdsize",
-        "4",                 # was 2; ignore smaller specks/rogue lines
-        "--alphamax",
-        "1.2",               # crisper corners
-        "--opttolerance",
-        "0.35",              # smoother where it can be
-        "--turnpolicy",
-        "minority",
-        "-o",
-        stroke_svg_path,
-    ]
-    rc, _, err = _run(potrace_cmd)
-    if rc != 0:
-        raise RuntimeError(f"potrace failed: {err.decode('utf-8', 'ignore')}")
-
-    # 6) Compose SVG: use VTracer <svg> as base; import PATHS from Potrace on top
-    fills_tree = ET.parse(fills_svg_path)
-    fills_root = fills_tree.getroot()
-
-    stroke_tree = ET.parse(stroke_svg_path)
-    stroke_root = stroke_tree.getroot()
-
-    def _tag(t: str) -> str:
-        return t.split("}")[-1] if "}" in t else t
-
-    # Create a stroke group with explicit stroke attributes (NO fill!)
-    stroke_group = ET.Element(
-        "g",
-        attrib={
-            "id": "stroke-layer",
-            "fill": "none",
-            "stroke": stroke_color_hex,
-            "stroke-width": "2",
-            "stroke-linejoin": "round",
-            "stroke-linecap": "round",
-        },
-    )
-
-    for el in stroke_root.iter():
-        if _tag(el.tag) == "path":
-            el.attrib.pop("fill", None)
-            el.set("stroke", stroke_color_hex)
-            el.set("stroke-width", "2")
-            el.set("fill", "none")
-            stroke_group.append(el)
-
-    fills_root.append(stroke_group)
-
-    # 7) Serialize to bytes
-    svg_bytes = ET.tostring(fills_root, encoding="utf-8", method="xml")
-
-    # cleanup temp files
-    for p in (png_path, fills_svg_path, pbm_path, stroke_svg_path):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-    return svg_bytes
+    png_path = _write_temp_image(im
