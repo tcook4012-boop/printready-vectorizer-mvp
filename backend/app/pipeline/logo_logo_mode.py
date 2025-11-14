@@ -21,7 +21,7 @@ from PIL import Image, ImageFilter
 
 
 # =========================
-# Small helpers (copied from logo_safe, lightly tuned)
+# Small helpers (similar to logo_safe, tuned for logos)
 # =========================
 
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
@@ -133,7 +133,7 @@ def _write_temp_image(im: Image.Image, suffix: str) -> str:
     return path
 
 
-def _run(cmd: list, input_bytes: Optional[bytes] = None):
+def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE if input_bytes else None,
@@ -198,10 +198,18 @@ def vectorize_logo_logo_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
 
     rc, _, err = _run(["vtracer", "-i", png_path, "-o", svg_path])
     if rc != 0:
-        raise RuntimeError(f"vtracer failed (logo mode): {err.decode('utf-8', 'ignore')}")
+        raise RuntimeError(
+            f"vtracer failed (logo mode): {err.decode('utf-8', 'ignore')}"
+        )
 
     with open(svg_path, "rb") as f:
         svg_bytes = f.read()
 
     # Cleanup
-    for p in (png_p_
+    for p in (png_path, svg_path):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    return svg_bytes
