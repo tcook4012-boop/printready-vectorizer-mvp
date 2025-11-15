@@ -171,7 +171,6 @@ def vectorize_logo_logo_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
             "--output", svg_path,
             "--mode", "spline",
             "--colormode", "color",
-            "--hierarchical", "true",
             "--filter_speckle", "4",
         ]
 
