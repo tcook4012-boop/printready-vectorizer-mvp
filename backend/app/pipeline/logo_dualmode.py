@@ -1,97 +1,80 @@
-# backend/app/pipeline/logo_dualmode.py
-
-"""
-Dual-mode wrapper around the existing pipelines.
-
-  - "sign"  → uses logo_safe (your current sign / text pipeline)
-  - "logo"  → uses logo_logo_mode (new ELON-friendly pipeline)
-
-Signs (PECANS, Murillo) should classify as "sign".
-ELON-style mascots should classify as "logo".
-"""
-
-from typing import Literal
 import io
 
 from PIL import Image
 
-# Pipelines
-from .logo_safe import vectorize_logo_safe_to_svg_bytes as _sign_vectorize
-from .logo_logo_mode import vectorize_logo_logo_mode_to_svg_bytes as _logo_vectorize
-
-Mode = Literal["auto", "logo", "sign"]
+from .logo_safe import vectorize_logo_safe_to_svg_bytes
+from .logo_logo_mode import vectorize_logo_logo_mode_to_svg_bytes
 
 
-# =========================
-# Simple mode analysis
-# =========================
+# ---------- small helpers (minimal copy of logo_safe helpers) ----------
 
-def _approx_unique_colors(image_bytes: bytes, max_colors: int = 8) -> int:
+def _to_srgb_rgba(im: Image.Image) -> Image.Image:
+    if im.mode in ("P", "L"):
+        im = im.convert("RGBA")
+    elif im.mode == "RGB":
+        im = im.convert("RGBA")
+    elif im.mode == "LA":
+        im = im.convert("RGBA")
+    elif im.mode == "RGBA":
+        pass
+    else:
+        im = im.convert("RGBA")
+    return im
+
+
+def _composite_over_white(im: Image.Image) -> Image.Image:
+    if im.mode != "RGBA":
+        return im.convert("RGB")
+    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    out = Image.alpha_composite(bg, im)
+    return out.convert("RGB")
+
+
+def _estimate_unique_colors(im: Image.Image) -> int:
     """
-    Approximate number of distinct colors in the input.
+    Rough estimate of how many 'meaningful' colors the artwork has.
 
-    We keep this very cheap and robust. It is only used for a coarse decision
-    between "sign" and "logo".
+    We quantize to 16 colors on a downscaled version and count how many
+    palette entries are actually used.
     """
-    im = Image.open(io.BytesIO(image_bytes))
-
-    if im.mode not in ("RGB", "RGBA"):
-        im = im.convert("RGB")
-    if im.mode == "RGBA":
-        from PIL import Image as PILImage  # avoid confusion with imported Image
-        bg = PILImage.new("RGBA", im.size, (255, 255, 255, 255))
-        im = PILImage.alpha_composite(bg, im).convert("RGB")
-
-    pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=max_colors)
-    colors = pal_img.getcolors(maxcolors=max_colors)
-    if not colors:
-        return 0
+    thumb = im.copy()
+    thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
+    pal = thumb.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+    colors = pal.getcolors(maxcolors=256) or []
     return len(colors)
 
 
-def _analyze_mode(image_bytes: bytes) -> Mode:
+def _decide_mode(im: Image.Image) -> str:
     """
-    Heuristic:
+    Heuristic router:
 
-      - <= 3 colors → likely a simple sign (PECANS, many yard signs) → "sign"
-      - >= 4 colors → more logo-like (ELON: white, gold, maroon, black) → "logo"
-
-    This is intentionally simple and easy to tweak later if we see mis-classified
-    examples in your real workload.
+    - If we see 5 or more distinct colors -> 'logo' (mascot / complex logo).
+    - Otherwise -> 'sign' (flat 1–4 color sign / text).
     """
-    try:
-        n = _approx_unique_colors(image_bytes)
-    except Exception:
-        return "sign"
+    approx_unique = _estimate_unique_colors(im)
 
-    if n >= 4:
+    if approx_unique >= 5:
         return "logo"
     return "sign"
 
 
-# =========================
-# Public entry point
-# =========================
-
-def vectorize_logo_dualmode_to_svg_bytes(
-    image_bytes: bytes,
-    mode: Mode = "auto",
-) -> bytes:
+def vectorize_logo_dualmode_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Entry point used by FastAPI.
+    Router that decides which pipeline to use based on the input artwork.
 
-      - mode="auto": infer "sign" vs "logo" from the image
-      - mode="sign": force the sign pipeline
-      - mode="logo": force the logo pipeline
+    - 'sign'  -> high-clarity sign/text pipeline (logo_safe)
+    - 'logo'  -> smoother, palette-locked mascot pipeline (logo_logo_mode)
     """
-    if mode == "auto":
-        inferred = _analyze_mode(image_bytes)
-        if inferred in ("logo", "sign"):
-            mode = inferred
-        else:
-            mode = "sign"
+    # Decode once here for routing
+    im = Image.open(io.BytesIO(image_bytes))
+    im = _to_srgb_rgba(im)
+    im = _composite_over_white(im)
+
+    mode = _decide_mode(im)
 
     if mode == "logo":
-        return _logo_vectorize(image_bytes)
-    else:
-        return _sign_vectorize(image_bytes)
+        # ELON-style artwork comes here
+        return vectorize_logo_logo_mode_to_svg_bytes(image_bytes)
+
+    # default / fallback: sign/text mode
+    return vectorize_logo_safe_to_svg_bytes(image_bytes)
