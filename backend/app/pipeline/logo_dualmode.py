@@ -1,14 +1,24 @@
 # backend/app/pipeline/logo_dualmode.py
 
+"""
+Routing layer that chooses between:
+
+  - sign mode  (logo_sign_mode)  -> high-clarity text / sign pipeline
+  - logo mode  (logo_logo_mode)  -> mascot / complex logo pipeline
+
+The decision is based on an approximate color-count heuristic.
+"""
+
 import io
 
 from PIL import Image
 
-from .logo_logo_mode import vectorize_logo_logo_mode_to_svg_bytes
 from .logo_sign_mode import vectorize_logo_sign_mode_to_svg_bytes
+from .logo_logo_mode import vectorize_logo_logo_mode_to_svg_bytes
 
 
-# ---------- small helpers (same as before) ----------
+# ---------- small helpers (minimal copy of logo_safe helpers) ----------
+
 
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
     if im.mode in ("P", "L"):
@@ -51,7 +61,12 @@ def _decide_mode(im: Image.Image) -> str:
     Heuristic router:
 
     - If we see 5 or more distinct colors -> 'logo' (mascot / complex logo).
-    - Otherwise -> 'sign' (flat 1–4 color sign / text / low-color logo).
+    - Otherwise -> 'sign' (flat 1–4 color sign / text / simple logo).
+
+    This means:
+      - ELON (multi-color mascot) → 'logo'
+      - Murillo / PECANS signs   → 'sign'
+      - One-color logos with lots of text → 'sign'
     """
     approx_unique = _estimate_unique_colors(im)
 
@@ -60,14 +75,12 @@ def _decide_mode(im: Image.Image) -> str:
     return "sign"
 
 
-# ---------- main router ----------
-
 def vectorize_logo_dualmode_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
     Router that decides which pipeline to use based on the input artwork.
 
-    - 'sign'  -> high-clarity sign/text pipeline (logo_sign_mode)
-    - 'logo'  -> smoother, palette-locked mascot pipeline (logo_logo_mode)
+    - 'sign' -> high-clarity sign/text pipeline (logo_sign_mode)
+    - 'logo' -> smoother, palette-locked mascot pipeline (logo_logo_mode)
     """
     # Decode once here for routing
     im = Image.open(io.BytesIO(image_bytes))
@@ -77,7 +90,7 @@ def vectorize_logo_dualmode_to_svg_bytes(image_bytes: bytes) -> bytes:
     mode = _decide_mode(im)
 
     if mode == "logo":
-        # ELON-style or other multi-color mascot artwork
+        # ELON-style artwork, complex logos, etc.
         return vectorize_logo_logo_mode_to_svg_bytes(image_bytes)
 
     # default / fallback: sign/text mode
