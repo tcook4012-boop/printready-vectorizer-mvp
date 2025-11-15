@@ -1,28 +1,31 @@
 # backend/app/pipeline/logo_sign_mode.py
 
 """
-Sign / text optimized vectorization pipeline.
+Sign / flat-text optimized vectorization pipeline.
 
-Goals:
-- Kill purple/gray AA halo around letters, numbers, borders, and stars.
-- Keep flat fills for 1–4 color art (single-color logos, yard signs, etc.).
-- Produce smoother curves and less jagged diagonals on text and flags.
+Goals for PECANS / Murillo / political signs / flat logos:
+- No purple/gray halo around letters, shapes, or stars.
+- No interior haze inside white shapes (e.g., stars).
+- Very crisp straight edges and smooth curves.
+- Flat fills only (no strokes in the final SVG).
+
+This pipeline is intentionally MORE aggressive than the mascot pipeline:
+we can blur and regularize more because signs are simple, flat-color art.
 """
 
 import io
 import os
 import subprocess
 import tempfile
-from typing import Tuple
+from typing import Tuple, Optional
 
 from PIL import Image, ImageFilter
 
 
 # ========= small helpers =========
 
-
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
-    """Normalize image to RGBA."""
+    """Normalize to RGBA in a predictable way."""
     if im.mode in ("P", "L"):
         im = im.convert("RGBA")
     elif im.mode == "RGB":
@@ -37,7 +40,12 @@ def _to_srgb_rgba(im: Image.Image) -> Image.Image:
 
 
 def _composite_over_white(im: Image.Image) -> Image.Image:
-    """Flatten alpha onto white background."""
+    """
+    Flatten any transparency over pure white.
+
+    This removes semi-transparent edges which would otherwise turn into
+    purple/gray fringes when quantized.
+    """
     if im.mode != "RGBA":
         return im.convert("RGB")
     bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
@@ -47,11 +55,8 @@ def _composite_over_white(im: Image.Image) -> Image.Image:
 
 def _sample_bg_color(im: Image.Image) -> Tuple[int, int, int]:
     """
-    Sample the 4 corners and take the median as 'background'.
-
-    This works for:
-    - white background with colored text
-    - colored background with white text
+    Guess the background color by looking at the 4 corners and taking
+    the median in each channel.
     """
     w, h = im.size
     pts = [
@@ -67,91 +72,109 @@ def _sample_bg_color(im: Image.Image) -> Tuple[int, int, int]:
 
 
 def _color_dist_sq(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
-    """Fast squared RGB distance."""
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
-def _build_halo_mask(
+def _hard_dehalo_to_bg(
     im: Image.Image,
-    bg: Tuple[int, int, int],
-    dist_thresh_sq: int = 35 * 35,
+    bg: Optional[Tuple[int, int, int]] = None,
+    thresh_sq: int = 16 * 16,
 ) -> Image.Image:
     """
-    Build a mask for "halo" pixels close to the background color.
+    Strong dehalo for flat signs.
 
-    dist_thresh_sq is intentionally large for sign art because shapes are
-    big and we can afford aggressive halo removal without eating real strokes.
+    Any pixel sufficiently close to background is turned into *exact*
+    background color, and then we dilate that region ~2px to eat away
+    all anti-aliased fringe.
+
+    This is intentionally more aggressive than the mascot pipeline.
     """
+    im = im.copy()
+    if bg is None:
+        bg = _sample_bg_color(im)
+
     w, h = im.size
-    mask = Image.new("L", (w, h), 0)
+    pix = im.load()
+
+    # Build a mask of "background-like" pixels
+    mask = Image.new("L", im.size, 0)
     mp = mask.load()
-    px = im.load()
 
     for y in range(h):
         for x in range(w):
-            r, g, b = px[x, y]
-            if _color_dist_sq((r, g, b), bg) <= dist_thresh_sq:
+            r, g, b = pix[x, y]
+            if _color_dist_sq((r, g, b), bg) <= thresh_sq:
                 mp[x, y] = 255
 
-    # Grow mask ~1px so the entire AA fringe is covered
-    mask = mask.filter(ImageFilter.MaxFilter(3))
-    return mask
+    # Grow that mask a bit (2–3 pixels) to remove fringe
+    # Pillow filters require an ODD size.
+    mask = mask.filter(ImageFilter.MaxFilter(5))
+
+    # Paste exact background color wherever the mask is white
+    bg_img = Image.new("RGB", im.size, bg)
+    im.paste(bg_img, mask=mask)
+
+    return im
 
 
-def _upsample_reasonable(im: Image.Image) -> Image.Image:
+def _upsample_for_signs(im: Image.Image) -> Image.Image:
     """
-    Upsample 2x for better curve fitting, unless already huge.
-
-    This helps VTracer fit smoother spline curves on diagonal edges and circles.
+    Upsample 2x to give VTracer more pixels to work with,
+    but avoid blowing up *huge* inputs.
     """
     w, h = im.size
-    if max(w, h) >= 3000:
+    max_dim = max(w, h)
+    if max_dim >= 3000:
+        # already huge, don't upsample more
         return im
     return im.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
 
 
 def _estimate_unique_colors(im: Image.Image) -> int:
     """
-    Rough estimate of how many 'meaningful' colors the artwork has.
+    Rough estimate of color count on a small thumbnail.
     """
     thumb = im.copy()
     thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
-    pal = thumb.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+    pal = thumb.convert("P", palette=Image.Palette.ADAPTIVE, colors=8)
     colors = pal.getcolors(maxcolors=256) or []
     return len(colors)
 
 
-def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
+def _quantize_flat_palette(im: Image.Image, k: int) -> Image.Image:
     """
-    Palette quantization with no dithering.
+    Quantize to k colors with NO dithering.
 
-    We keep k small (2–6) for sign art so fills stay perfectly flat.
+    This is what enforces true flat fills (no gradients).
     """
-    k = max(2, min(int(k), 6))
-    q = im.quantize(colors=k, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
+    k = max(2, min(int(k), 8))
+    q = im.convert(
+        "P",
+        palette=Image.Palette.ADAPTIVE,
+        colors=k,
+        dither=Image.Dither.NONE,
+    )
     return q.convert("RGB")
 
 
-def _regularize_sign_edges(im: Image.Image) -> Image.Image:
+def _regularize_sign_shapes(im: Image.Image, k: int) -> Image.Image:
     """
-    Stronger regularization for sign/text art.
+    Two-stage regularization:
+      1) Blur slightly to smooth stair-steps and curves.
+      2) Quantize BACK to the same palette to snap to flat fills.
 
-    - MinFilter/MaxFilter smooth tiny bites and gaps in strokes.
-    - A small Gaussian blur softens stair-steps on diagonals/curves.
+    This removes interior haze (like in white stars) and cleans edges.
     """
-    # NOTE: Pillow requires an odd filter size (3, 5, ...).
-    im = im.filter(ImageFilter.MinFilter(3))
-    im = im.filter(ImageFilter.MaxFilter(3))
-    im = im.filter(ImageFilter.GaussianBlur(radius=0.4))
+    # Slight blur (stronger than mascot mode, but fine for signs)
+    im = im.filter(ImageFilter.GaussianBlur(radius=1.3))
+    # Snap back to a flat palette
+    im = _quantize_flat_palette(im, k=k)
     return im
 
 
 def _write_temp_image(im: Image.Image) -> Tuple[str, tempfile.TemporaryDirectory]:
-    """
-    Save image in a TemporaryDirectory and return (png_path, tmpdir).
-    """
     tmpdir = tempfile.TemporaryDirectory()
-    png_path = os.path.join(tmpdir.name, "sign_input.png")
+    png_path = os.path.join(tmpdir.name, "in.png")
     im.save(png_path, "PNG")
     return png_path, tmpdir
 
@@ -168,61 +191,49 @@ def _run(cmd):
 
 # ========= main pipeline =========
 
-
 def vectorize_logo_sign_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Sign / text pipeline.
-
-    Typical inputs:
-    - Single-color signs (any color) with text and shapes.
-    - Political yard signs like MURILLO.
-    - Phone-number yard signs like PECANS.
-    - Logos with a lot of text but low overall color count.
+    Sign / flat-text pipeline.
 
     Steps:
-    1) Load and flatten onto solid background.
-    2) Build and apply a strong halo mask near the background color.
-    3) Upsample 2x (if not enormous).
-    4) Quantize to a small palette (2–6 colors), no dithering.
-    5) Regularize edges for cleaner vectors.
-    6) Run VTracer (spline, color).
+      - Composite over white (remove alpha).
+      - Hard dehalo versus background (kills halo fully).
+      - Upsample 2x.
+      - Quantize to 2–4 flat colors (depending on input).
+      - Smooth + re-quantize to flatten interior haze.
+      - Vectorize with VTracer (fills only).
     """
     # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
-    im_rgb = _composite_over_white(im)
+    im = _composite_over_white(im)
 
-    # 1) Strong halo cleanup toward background color
-    bg = _sample_bg_color(im_rgb)
-    halo_mask = _build_halo_mask(im_rgb, bg, dist_thresh_sq=35 * 35)
+    # 1) Strong dehalo against inferred background
+    bg = _sample_bg_color(im)
+    im = _hard_dehalo_to_bg(im, bg=bg, thresh_sq=16 * 16)
 
-    bg_img = Image.new("RGB", im_rgb.size, bg)
-    im_rgb.paste(bg_img, mask=halo_mask)
+    # 2) Upsample for smoother curves
+    im = _upsample_for_signs(im)
 
-    # 2) Upsample for smoother curve fitting
-    im_rgb = _upsample_reasonable(im_rgb)
-
-    # 3) Estimate palette size and quantize
-    approx_unique = _estimate_unique_colors(im_rgb)
-
+    # 3) Estimate color count, then clamp between 2 and 4
+    approx_unique = _estimate_unique_colors(im)
     if approx_unique <= 2:
         k = 2
     elif approx_unique == 3:
         k = 3
-    elif approx_unique == 4:
-        k = 4
     else:
-        k = min(6, approx_unique)
+        k = 4
 
-    im_q = _quantize_no_dither(im_rgb, k)
+    # 4) Quantize to flat palette
+    im = _quantize_flat_palette(im, k=k)
 
-    # 4) Edge regularization to reduce jaggedness
-    im_reg = _regularize_sign_edges(im_q)
+    # 5) Smooth shapes and snap back to palette
+    im = _regularize_sign_shapes(im, k=k)
 
-    # 5) Vectorize with VTracer
-    png_path, tmpdir = _write_temp_image(im_reg)
+    # 6) Run VTracer once (fills only, no stroke overlay)
+    png_path, tmpdir = _write_temp_image(im)
     try:
-        svg_path = os.path.join(tmpdir.name, "sign_output.svg")
+        svg_path = os.path.join(tmpdir.name, "out.svg")
 
         cmd = [
             "vtracer",
@@ -230,7 +241,7 @@ def vectorize_logo_sign_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
             "--output", svg_path,
             "--mode", "spline",
             "--colormode", "color",
-            "--filter_speckle", "3",
+            "--filter_speckle", "8",
         ]
 
         code, out, err = _run(cmd)
