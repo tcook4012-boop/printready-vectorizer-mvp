@@ -1,31 +1,15 @@
-# backend/app/pipeline/logo_logo_mode.py
-
-"""
-Logo-focused variant of the logo_safe pipeline.
-
-This is intended for mascot / logo art like ELON where we want:
-  - Multiple flat colors preserved (coat, beard, hat, letters, background)
-  - No extra outline strokes
-  - Less aggressive smoothing than the sign pipeline (keep facial detail)
-
-Signs (PECANS, Murillo) should continue to use the main logo_safe pipeline.
-"""
-
 import io
 import os
 import subprocess
 import tempfile
-from typing import Optional, Tuple
+from typing import Tuple
 
 from PIL import Image, ImageFilter
 
 
-# =========================
-# Small helpers (similar to logo_safe, tuned for logos)
-# =========================
+# ========= small helpers (light copy of logo_safe) =========
 
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
-    """Normalize to RGBA, sRGB-ish."""
     if im.mode in ("P", "L"):
         im = im.convert("RGBA")
     elif im.mode == "RGB":
@@ -40,7 +24,6 @@ def _to_srgb_rgba(im: Image.Image) -> Image.Image:
 
 
 def _composite_over_white(im: Image.Image) -> Image.Image:
-    """Flatten alpha over white to kill semi-transparent halos."""
     if im.mode != "RGBA":
         return im.convert("RGB")
     bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
@@ -49,167 +32,157 @@ def _composite_over_white(im: Image.Image) -> Image.Image:
 
 
 def _sample_bg_color(im: Image.Image) -> Tuple[int, int, int]:
-    """Very quick modal of 4 corners to guess background color."""
+    """Sample the 4 corners and take the median as 'background'."""
     w, h = im.size
-    pts = [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)]
-    samples = [im.getpixel(p) for p in pts]
-    counts = {}
-    for c in samples:
-        counts[c] = counts.get(c, 0) + 1
-    return max(counts.items(), key=lambda kv: kv[1])[0]
+    pts = [
+        im.getpixel((0, 0)),
+        im.getpixel((w - 1, 0)),
+        im.getpixel((0, h - 1)),
+        im.getpixel((w - 1, h - 1)),
+    ]
+    rs = sorted(p[0] for p in pts)
+    gs = sorted(p[1] for p in pts)
+    bs = sorted(p[2] for p in pts)
+    return (rs[1], gs[1], bs[1])
 
 
-def _color_dist(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
-    """Fast RGB squared distance."""
+def _color_dist_sq(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> int:
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
-def _dehalo_to_white(
-    im: Image.Image,
-    bg: Optional[Tuple[int, int, int]] = None,
-    dist_thresh_sq: int = 9 * 9,
-) -> Image.Image:
+def _dehalo_to_white(im: Image.Image, bg: Tuple[int, int, int]) -> Image.Image:
     """
-    Replace pixels close to the background with pure white, then grow by ~1px.
+    Very light dehalo: anything extremely close to background becomes pure white.
 
-    Slightly gentler than the sign pipeline: we still remove fringe but avoid
-    eating into fine features (eyes, facial lines).
+    For mascot logos we *do not* want heavy shrinking of shapes, just removal
+    of the faint anti-alias blend around edges.
     """
-    im = im.copy()
+    pix = im.load()
     w, h = im.size
-    if bg is None:
-        bg = _sample_bg_color(im)
-
-    px = im.load()
-    mask = Image.new("L", im.size, 0)
-    mp = mask.load()
+    # threshold ~ 8 in RGB distance
+    thresh_sq = 8 * 8
     for y in range(h):
         for x in range(w):
-            p = px[x, y]
-            if _color_dist(p, bg) <= dist_thresh_sq:
-                mp[x, y] = 255
-
-    # grow mask ~1px instead of 2–3px
-    mask = mask.filter(ImageFilter.MaxFilter(size=3))
-    white = Image.new("RGB", im.size, (255, 255, 255))
-    im.paste(white, mask=mask)
+            r, g, b = pix[x, y]
+            if _color_dist_sq((r, g, b), bg) <= thresh_sq:
+                pix[x, y] = (255, 255, 255)
     return im
 
 
 def _upsample_2x(im: Image.Image) -> Image.Image:
-    return im.resize((im.width * 2, im.height * 2), Image.Resampling.LANCZOS)
+    w, h = im.size
+    if max(w, h) >= 3000:
+        # avoid blowing up memory on huge inputs
+        return im
+    return im.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
 
 
-def _quantize_no_dither(im: Image.Image, k: int) -> Image.Image:
-    """Median cut to k colors, no dithering."""
-    q = im.quantize(colors=k, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
-    return q.convert("RGB")
+def _quantize_palette(im: Image.Image, k: int) -> Image.Image:
+    """
+    Palette quantization with *no* dithering.
+
+    We keep k relatively high (5–8) to preserve distinct uniform fills like
+    coat vs beard vs outline.
+    """
+    k = max(2, min(int(k), 16))
+    return (
+        im.convert("P", palette=Image.Palette.ADAPTIVE, colors=k,
+                  dither=Image.Dither.NONE)
+          .convert("RGB")
+    )
 
 
 def _gentle_regularize_logo(im: Image.Image) -> Image.Image:
     """
-    Slightly gentler regularization for logos:
+    Gentle shape regularization for mascot logos.
 
-    - small Min/Max filters to close tiny gaps without shrinking shapes
-    - lighter blur to keep edges smoother but not melted
-
-    NOTE: Pillow requires an ODD filter size (3, 5, ...) for MinFilter/MaxFilter.
+    We apply a very small blur only, no min/max morphological operations.
+    This avoids 'shrinking' details or creating dark outlines.
     """
-    im = im.filter(ImageFilter.MinFilter(3))
-    im = im.filter(ImageFilter.MaxFilter(3))
+    # radius 0.6–0.8 is enough to smooth stair-steps without eating corners
     im = im.filter(ImageFilter.GaussianBlur(radius=0.7))
     return im
 
 
-def _reindex_to_palette(im: Image.Image, k: int) -> Image.Image:
-    """Snap smoothed image back to an exact K-color palette."""
-    return _quantize_no_dither(im, k)
+def _write_temp_image(im: Image.Image) -> Tuple[str, tempfile.TemporaryDirectory]:
+    tmpdir = tempfile.TemporaryDirectory()
+    png_path = os.path.join(tmpdir.name, "in.png")
+    im.save(png_path, "PNG")
+    return png_path, tmpdir
 
 
-def _write_temp_image(im: Image.Image, suffix: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    im.save(path)
-    return path
-
-
-def _run(cmd: list, input_bytes: Optional[bytes] = None) -> Tuple[int, bytes, bytes]:
-    proc = subprocess.Popen(
+def _run(cmd):
+    result = subprocess.run(
         cmd,
-        stdin=subprocess.PIPE if input_bytes else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        check=False,
     )
-    out, err = proc.communicate(input=input_bytes)
-    return proc.returncode, out, err
+    return result.returncode, result.stdout, result.stderr
 
 
-# =========================
-# Main logo pipeline
-# =========================
+# ========= main pipeline =========
+
 
 def vectorize_logo_logo_mode_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Logo-focused vectorization:
+    Mascot / complex logo pipeline.
 
-      - Upsample 2x
-      - Gentle dehalo over white
-      - Palette clamp with slightly higher cap (up to 6 colors)
-      - Regularize edges (lighter than sign pipeline)
-      - VTracer fills ONLY (no Potrace stroke overlay)
-
-    This should help ELON keep:
-      - separate coat / beard / hat / letter colors
-      - inner details (eye, buttons)
-      - smooth curves without the extra red outline.
+    Goals:
+    - Preserve distinct fills (coat vs beard vs outline).
+    - Avoid red/brown outlines around shapes.
+    - Keep medium-smooth curves without erasing detail.
     """
-    # 0) Load & normalize
     im = Image.open(io.BytesIO(image_bytes))
     im = _to_srgb_rgba(im)
     im = _composite_over_white(im)
+
+    # 1) very light dehalo to clean background fringe
+    bg = _sample_bg_color(im)
+    im = im.convert("RGB")
+    im = _dehalo_to_white(im, bg)
+
+    # 2) modest 2x upsample (if not already huge)
     im = _upsample_2x(im)
 
-    # 1) Dehalo against white-ish background
-    im = _dehalo_to_white(im, bg=None, dist_thresh_sq=9 * 9)
+    # 3) estimate how many colors we actually need, cap 8, min 5
+    thumb = im.copy()
+    thumb.thumbnail((256, 256), Image.Resampling.LANCZOS)
+    pal = thumb.convert("P", palette=Image.Palette.ADAPTIVE, colors=16)
+    colors = pal.getcolors(maxcolors=256) or []
+    approx_unique = len(colors)
+    k = max(5, min(8, approx_unique))
 
-    # 2) Estimate unique-ish colors and choose palette size.
-    pal_img = im.convert("P", palette=Image.Palette.ADAPTIVE, colors=8)
-    approx_unique = len(pal_img.getcolors() or [])
+    # 4) quantize to stable palette without dithering
+    im = _quantize_palette(im, k=k)
 
-    # Bound between 3 and 6 colors; try to keep enough breathing room.
-    if approx_unique <= 3:
-        k = 3
-    elif approx_unique == 4:
-        k = 4
-    else:
-        k = min(6, approx_unique)
+    # 5) gentle smoothing to remove stair-steps, *after* palette locking
+    im = _gentle_regularize_logo(im)
 
-    # 3) Quantize (no dithering)
-    im_q = _quantize_no_dither(im, k)
+    # 6) Run vtracer directly (no extra Potrace overlay here).
+    png_path, tmpdir = _write_temp_image(im)
+    try:
+        svg_path = os.path.join(tmpdir.name, "out.svg")
 
-    # 4) Gentler regularization and snap-to-palette
-    im_smooth = _gentle_regularize_logo(im_q)
-    im_final = _reindex_to_palette(im_smooth, k)
+        # Slight bias toward smoothness but still preserving details.
+        cmd = [
+            "vtracer",
+            "--input", png_path,
+            "--output", svg_path,
+            "--mode", "spline",
+            "--colormode", "color",
+            "--hierarchical", "true",
+            "--filter_speckle", "4",
+        ]
 
-    # 5) Single-pass vectorization with VTracer (fills only)
-    png_path = _write_temp_image(im_final, ".png")
-    svg_fd, svg_path = tempfile.mkstemp(suffix=".svg")
-    os.close(svg_fd)
+        code, out, err = _run(cmd)
+        if code != 0 or not os.path.exists(svg_path):
+            msg = err.decode("utf-8", "ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+            raise RuntimeError(f"vtracer failed (logo mode): {msg}")
 
-    rc, _, err = _run(["vtracer", "-i", png_path, "-o", svg_path])
-    if rc != 0:
-        raise RuntimeError(
-            f"vtracer failed (logo mode): {err.decode('utf-8', 'ignore')}"
-        )
-
-    with open(svg_path, "rb") as f:
-        svg_bytes = f.read()
-
-    # Cleanup
-    for p in (png_path, svg_path):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+        with open(svg_path, "rb") as f:
+            svg_bytes = f.read()
+    finally:
+        tmpdir.cleanup()
 
     return svg_bytes
