@@ -1,12 +1,15 @@
+# backend/app/pipeline/logo_dualmode.py
+
 import io
 
 from PIL import Image
 
-from .logo_safe import vectorize_logo_safe_to_svg_bytes
 from .logo_logo_mode import vectorize_logo_logo_mode_to_svg_bytes
+from .logo_sign_mode import vectorize_logo_sign_mode_to_svg_bytes
 
 
 # ---------- small helpers (minimal copy of logo_safe helpers) ----------
+
 
 def _to_srgb_rgba(im: Image.Image) -> Image.Image:
     if im.mode in ("P", "L"):
@@ -60,10 +63,8 @@ def _decide_mode(im: Image.Image) -> str:
 
 def vectorize_logo_dualmode_to_svg_bytes(image_bytes: bytes) -> bytes:
     """
-    Router that decides which pipeline to use based on the input artwork.
-
-    - 'sign'  -> high-clarity sign/text pipeline (logo_safe)
-    - 'logo'  -> smoother, palette-locked mascot pipeline (logo_logo_mode)
+    Route to either the sign pipeline or the mascot/logo pipeline
+    based on the number of distinct colors.
     """
     # Decode once here for routing
     im = Image.open(io.BytesIO(image_bytes))
@@ -73,8 +74,8 @@ def vectorize_logo_dualmode_to_svg_bytes(image_bytes: bytes) -> bytes:
     mode = _decide_mode(im)
 
     if mode == "logo":
-        # ELON-style artwork comes here
+        # ELON-style mascot artwork comes here
         return vectorize_logo_logo_mode_to_svg_bytes(image_bytes)
 
     # default / fallback: sign/text mode
-    return vectorize_logo_safe_to_svg_bytes(image_bytes)
+    return vectorize_logo_sign_mode_to_svg_bytes(image_bytes)
